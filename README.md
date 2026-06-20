@@ -14,11 +14,11 @@ This project is not affiliated with Nintendo, Game Freak, or The Pokémon Compan
 
 This project is licensed under the MIT License.
 
-<img width="2545" height="1434" alt="{5A24AF13-AB1D-4216-8E30-0B9EBB78C49B}" src="https://github.com/user-attachments/assets/ad4d4cf4-54a0-4483-876e-d56f53a5008e" />
+<img width="2745" height="1567" alt="image" src="https://github.com/user-attachments/assets/89e17a2f-0fff-4d14-9d4c-08bc04efe935" />
+<img width="2745" height="1593" alt="image" src="https://github.com/user-attachments/assets/4112d8b5-cbc6-4b5f-bb29-e9a3195679bf" />
+<img width="2745" height="1593" alt="image" src="https://github.com/user-attachments/assets/10b05b73-032f-4c73-ba5d-1f49cd487134" />
 
-<img width="2541" height="1425" alt="{8DB14912-9E99-47A4-B72B-628DC4303EBB}" src="https://github.com/user-attachments/assets/e3bd07eb-cf4e-4c7f-9fc2-87e3581f4d65" />
 
-<img width="2543" height="1426" alt="{C0836482-31D0-47BA-89FB-E6E38F1751BC}" src="https://github.com/user-attachments/assets/ffc2dad8-a48f-43b5-a8f3-7a9c26f7e064" />
 
 https://github.com/koziyagoukei/ExpansionStudio/releases
 

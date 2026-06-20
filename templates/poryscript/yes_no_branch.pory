@@ -1,0 +1,10 @@
+// Ask a yes/no question and branch using VAR_RESULT.
+script {{SCRIPT_NAME}} {
+    msgbox("{{QUESTION}}", MSGBOX_YESNO)
+    if (var(VAR_RESULT) == 1) {
+        msgbox("{{YES_MESSAGE}}")
+    } else {
+        msgbox("{{NO_MESSAGE}}")
+    }
+    end
+}

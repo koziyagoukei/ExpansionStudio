@@ -1,0 +1,59 @@
+# Python
+
+**pycache**/
+*.py[cod]
+*$py.class
+
+# Virtual Environment
+
+venv/
+.venv/
+env/
+
+# IDE
+
+.vscode/
+.idea/
+
+# OS
+
+.DS_Store
+Thumbs.db
+
+# PyInstaller
+
+build/
+dist/
+_pyinstaller/
+*.spec
+
+# Workspace (user data)
+
+Workspace/
+workspace/
+cache/
+logs/
+temp/
+backups/
+exports/
+
+# Runtime files
+
+*.log
+
+# Generated files
+
+generated/
+output/
+
+# Release packages
+
+*.zip
+*.7z
+
+# Executables
+
+*.exe
+*.dll
+*.pyd
+*.bak

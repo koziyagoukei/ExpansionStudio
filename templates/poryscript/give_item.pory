@@ -1,0 +1,9 @@
+// Give an item. Confirm the precise item and bag-full behavior for this event.
+script {{SCRIPT_NAME}} {
+    lock
+    faceplayer
+    giveitem({{ITEM}}, {{QUANTITY}})
+    msgbox("{{SUCCESS_MESSAGE}}")
+    release
+    end
+}

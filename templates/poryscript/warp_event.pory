@@ -1,0 +1,7 @@
+// Warp to a map, warp id, and tile coordinates.
+script {{SCRIPT_NAME}} {
+    lock
+    warp({{MAP}}, {{WARP_ID}}, {{X}}, {{Y}})
+    release
+    end
+}

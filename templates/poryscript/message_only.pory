@@ -1,0 +1,5 @@
+// Display one message.
+script {{SCRIPT_NAME}} {
+    msgbox("{{MESSAGE}}")
+    end
+}

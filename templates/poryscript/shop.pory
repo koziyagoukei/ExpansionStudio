@@ -1,0 +1,14 @@
+// A shop script and its local item list.
+script {{SCRIPT_NAME}} {
+    lock
+    faceplayer
+    msgbox("{{WELCOME_MESSAGE}}")
+    pokemart({{MART_NAME}})
+    msgbox("{{GOODBYE_MESSAGE}}")
+    release
+    end
+}
+
+mart {{MART_NAME}} {
+    {{ITEMS}}
+}

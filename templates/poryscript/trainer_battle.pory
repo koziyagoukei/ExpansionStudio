@@ -1,0 +1,8 @@
+// Standard single trainer battle. Adjust the trainerbattle arguments if needed.
+script {{SCRIPT_NAME}} {
+    lock
+    faceplayer
+    trainerbattle(SINGLE, {{TRAINER}}, 0, "{{INTRO_MESSAGE}}", "{{DEFEAT_MESSAGE}}")
+    release
+    end
+}

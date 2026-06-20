@@ -13,6 +13,9 @@ before it overwrites a source file.
 This project is not affiliated with Nintendo, Game Freak, or The Pokémon Company.
 
 This project is licensed under the MIT License.
+
+
+
 ## Requirements
 
 * Python 3.10 or later
@@ -21,13 +24,13 @@ This project is licensed under the MIT License.
 Install the Python dependency from the repository root:
 
 ```powershell
-python -m pip install -r "workspace\requirements.txt"
+python -m pip install -r "requirements.txt"
 ```
 
 ## Start
 
 ```powershell
-python "workspace\ポケモンデコンプ作業ツール.py"
+python "Expansion Studio.py"
 ```
 
 Select the repository root when prompted, or set it in the toolbar. A valid
@@ -121,8 +124,3 @@ editable template location for the standalone application.
   as a `raw` block, rather than attempting an unsafe automatic rewrite. Flowchart
   rendering and structured graphical editing are not yet implemented.
 * Trainer, battle AI, and map editors are out of scope for the current version.
-
-## Existing translation editor
-
-`翻訳文章探すんです.py` is the original Tkinter translation editor. It remains
-available unchanged. New work should use `ポケモンデコンプ作業ツール.py`.

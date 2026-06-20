@@ -35,7 +35,7 @@ python -m pip install -r "requirements.txt"
 ## Start
 
 ```powershell
-python "Expansion Studio.py"
+python "ExpansionStudio.py"
 ```
 
 Select the repository root when prompted, or set it in the toolbar. A valid

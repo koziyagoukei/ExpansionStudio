@@ -20,6 +20,7 @@ This project is licensed under the MIT License.
 
 <img width="2543" height="1426" alt="{C0836482-31D0-47BA-89FB-E6E38F1751BC}" src="https://github.com/user-attachments/assets/ffc2dad8-a48f-43b5-a8f3-7a9c26f7e064" />
 
+https://github.com/koziyagoukei/ExpansionStudio/releases
 
 ## Requirements
 

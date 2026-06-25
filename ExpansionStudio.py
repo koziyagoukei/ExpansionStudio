@@ -20,7 +20,7 @@ from typing import Callable, Iterable
 
 try:
     from PySide6.QtCore import QProcess, QProcessEnvironment, QSettings, QTimer, Qt, Signal
-    from PySide6.QtGui import QAction, QFont, QIcon, QImage, QPixmap
+    from PySide6.QtGui import QAction, QFont, QIcon, QImage, QPixmap, QTextCursor
     from PySide6.QtWidgets import (
         QAbstractItemView,
         QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
@@ -270,6 +270,369 @@ def quote_c_text(value: str) -> str:
     return "".join(out)
 
 
+def read_define_int(root: Path, name: str, default: int) -> int:
+    constants = root / "include/constants/global.h"
+    if not constants.exists():
+        return default
+    match = re.search(rf"(?m)^\s*#define\s+{re.escape(name)}\s+(\d+)\b", read_utf8(constants))
+    return int(match.group(1)) if match else default
+
+
+def extract_c_text_symbol(source: str, symbol: str) -> str | None:
+    match = re.search(rf"\b{re.escape(symbol)}\s*(?:\[[^\]]*\])?\s*=\s*(?:_\s*\(|COMPOUND_STRING\s*\()", source)
+    if not match:
+        return None
+    parsed = parse_c_strings(source, match.end())
+    return parsed[2] if parsed else None
+
+
+@dataclass
+class AutoFormatSettings:
+    scope: str
+    font_id: str
+    max_width: int
+    range_start: int
+    range_end: int
+    skip_existing_breaks: bool
+    halfwidth_ascii: bool
+    safe_placeholders: bool
+    placeholder_max_chars: int = 20
+
+
+@dataclass
+class AutoFormatChange:
+    label: str
+    before: str
+    after: str
+    target: object | None = None
+    selection: tuple[int, int] | None = None
+
+
+class TextWidthModel:
+    ZERO_WIDTH_CONTROLS = {
+        "JPN", "ENG", "AUTO", "COLOR", "SHADOW", "HIGHLIGHT", "PALETTE", "PAUSE",
+        "PAUSE_MUSIC", "RESUME_MUSIC", "PLAY_SE", "PLAY_BGM", "WAIT_SE", "FILL_WINDOW",
+        "FONT", "RESET_FONT", "MIN_LETTER_SPACING", "SPEAKER", "ACCENT", "BACKGROUND",
+        "COLOR_HIGHLIGHT_SHADOW", "TEXT_COLORS", "ESCAPE", "SHIFT_RIGHT", "SHIFT_DOWN",
+    }
+    WIDTH_CONTROLS = {"CLEAR", "SKIP", "CLEAR_TO"}
+    FONT_JPN_WIDTHS = {"FONT_NORMAL": 7, "FONT_SMALL": 7, "FONT_NARROW": 7, "FONT_NARROWER": 7}
+    STATIC_PLACEHOLDER_SYMBOLS = {
+        "KUN": ("gText_ExpandedPlaceholder_Kun", "gText_ExpandedPlaceholder_Chan"),
+        "RIVAL": ("gText_ExpandedPlaceholder_May", "gText_ExpandedPlaceholder_Brendan", "gText_ExpandedPlaceholder_Red", "gText_ExpandedPlaceholder_Green"),
+        "VERSION": ("gText_ExpandedPlaceholder_Emerald",),
+        "AQUA": ("gText_ExpandedPlaceholder_Aqua",),
+        "MAGMA": ("gText_ExpandedPlaceholder_Magma",),
+        "ARCHIE": ("gText_ExpandedPlaceholder_Archie",),
+        "MAXIE": ("gText_ExpandedPlaceholder_Maxie",),
+        "KYOGRE": ("gText_ExpandedPlaceholder_Kyogre",),
+        "GROUDON": ("gText_ExpandedPlaceholder_Groudon",),
+        "REGION": ("gText_Hoenn", "gText_Kanto"),
+    }
+
+    def __init__(self, root: Path) -> None:
+        self.root = root
+        self.constants = {
+            "PLAYER_NAME_LENGTH": read_define_int(root, "PLAYER_NAME_LENGTH", 7),
+            "TRAINER_NAME_LENGTH": read_define_int(root, "TRAINER_NAME_LENGTH", 10),
+            "POKEMON_NAME_LENGTH": read_define_int(root, "POKEMON_NAME_LENGTH", 12),
+            "MOVE_NAME_LENGTH": read_define_int(root, "MOVE_NAME_LENGTH", 16),
+            "ITEM_NAME_LENGTH": read_define_int(root, "ITEM_NAME_LENGTH", 20),
+        }
+        self.static_placeholders = self.load_static_placeholders()
+
+    def load_static_placeholders(self) -> dict[str, list[str]]:
+        strings_path = self.root / "src/strings.c"
+        if not strings_path.exists():
+            return {}
+        source = read_utf8(strings_path)
+        result: dict[str, list[str]] = {}
+        for placeholder, symbols in self.STATIC_PLACEHOLDER_SYMBOLS.items():
+            values = [text for symbol in symbols if (text := extract_c_text_symbol(source, symbol)) is not None]
+            if values:
+                result[placeholder] = values
+        return result
+
+    def japanese_width(self, settings: AutoFormatSettings) -> int:
+        return self.FONT_JPN_WIDTHS.get(settings.font_id, 7)
+
+    @staticmethod
+    def is_japanese_like(char: str) -> bool:
+        code = ord(char)
+        return code >= 0x80 or 0x3040 <= code <= 0x30FF or 0x3000 <= code <= 0x303F or 0xFF00 <= code <= 0xFFEF
+
+    @staticmethod
+    def ascii_width(char: str) -> int:
+        if char == " ":
+            return 4
+        if char in "ilI.,'!|":
+            return 2
+        if char in "fjrt()[]{}":
+            return 4
+        if char in "MW@#%&":
+            return 7
+        return 5
+
+    def dynamic_placeholder_chars(self, name: str, settings: AutoFormatSettings) -> int:
+        limit = max(1, settings.placeholder_max_chars)
+        if name in {"PLAYER", "RIVAL", "B_PLAYER_NAME", "B_LINK_PLAYER_NAME"}:
+            return min(self.constants["PLAYER_NAME_LENGTH"], limit)
+        if "TRAINER" in name:
+            return min(self.constants["TRAINER_NAME_LENGTH"], limit)
+        if "MON" in name or "PKMN" in name or "POKEMON" in name:
+            return min(self.constants["POKEMON_NAME_LENGTH"], limit)
+        if "MOVE" in name:
+            return min(self.constants["MOVE_NAME_LENGTH"], limit)
+        if "ITEM" in name:
+            return min(self.constants["ITEM_NAME_LENGTH"], limit)
+        if name.startswith("STR_VAR") or name.startswith("B_BUFF") or name.startswith("B_COPY_VAR"):
+            return limit
+        if name == "KUN":
+            return min(2, limit)
+        if name in {"VERSION", "AQUA", "MAGMA", "ARCHIE", "MAXIE", "KYOGRE", "GROUDON", "REGION"}:
+            return min(10, limit)
+        if name.startswith("B_"):
+            return limit
+        return 0
+
+    def placeholder_width(self, name: str, settings: AutoFormatSettings) -> int:
+        if not settings.safe_placeholders:
+            return 0
+        static_values = self.static_placeholders.get(name)
+        if static_values:
+            return max(self.measure(value, settings) for value in static_values)
+        chars = self.dynamic_placeholder_chars(name, settings)
+        return chars * self.japanese_width(settings) if chars else 0
+
+    def placeholder_units(self, name: str, settings: AutoFormatSettings) -> int:
+        if not settings.safe_placeholders:
+            return 0
+        static_values = self.static_placeholders.get(name)
+        if static_values:
+            return max(self.visible_units(value, settings) for value in static_values)
+        return self.dynamic_placeholder_chars(name, settings)
+
+    @staticmethod
+    def control_number(body: str) -> int:
+        match = re.search(r"[-+]?\d+", body)
+        return max(0, int(match.group(0))) if match else 0
+
+    def brace_width(self, token: str, settings: AutoFormatSettings) -> int:
+        body = token[1:-1].strip()
+        name = body.split()[0] if body else ""
+        if name in self.ZERO_WIDTH_CONTROLS:
+            return 0
+        if name in self.WIDTH_CONTROLS:
+            return self.control_number(body)
+        return self.placeholder_width(name, settings)
+
+    def token_width(self, token: str, settings: AutoFormatSettings) -> int:
+        if token in {"\n", r"\n"}:
+            return 0
+        if token.startswith("{") and token.endswith("}"):
+            return self.brace_width(token, settings)
+        if len(token) == 2 and token.startswith("\\"):
+            return self.japanese_width(settings)
+        char = token[0]
+        if ord(char) < 0x80:
+            return self.ascii_width(char) if settings.halfwidth_ascii else self.japanese_width(settings)
+        return self.japanese_width(settings)
+
+    def iter_tokens(self, text: str) -> Iterable[tuple[str, int, int]]:
+        pos = 0
+        while pos < len(text):
+            if text.startswith(r"\n", pos):
+                yield r"\n", pos, pos + 2
+                pos += 2
+                continue
+            char = text[pos]
+            if char == "\n":
+                yield "\n", pos, pos + 1
+                pos += 1
+                continue
+            if char == "\\" and pos + 1 < len(text):
+                yield text[pos:pos + 2], pos, pos + 2
+                pos += 2
+                continue
+            if char == "{":
+                end = text.find("}", pos + 1)
+                if end > pos:
+                    yield text[pos:end + 1], pos, end + 1
+                    pos = end + 1
+                    continue
+            yield char, pos, pos + 1
+            pos += 1
+
+    def measure(self, text: str, settings: AutoFormatSettings) -> int:
+        width = 0
+        max_width = 0
+        for token, _start, _end in self.iter_tokens(text):
+            if token in {"\n", r"\n"}:
+                max_width = max(max_width, width)
+                width = 0
+            else:
+                width += self.token_width(token, settings)
+        return max(max_width, width)
+
+    def visible_units(self, text: str, settings: AutoFormatSettings) -> int:
+        total = 0
+        for token, _start, _end in self.iter_tokens(text):
+            if token in {"\n", r"\n"}:
+                continue
+            if token.startswith("{") and token.endswith("}"):
+                name = token[1:-1].strip().split()[0] if token[1:-1].strip() else ""
+                total += self.placeholder_units(name, settings)
+            elif not (token.startswith("\\") and len(token) == 2):
+                total += 1
+        return total
+
+
+class TextAutoFormatter:
+    def __init__(self, root: Path) -> None:
+        self.model = TextWidthModel(root)
+
+    @staticmethod
+    def has_existing_break(text: str) -> bool:
+        return "\n" in text or r"\n" in text
+
+    def format_text(self, text: str, settings: AutoFormatSettings) -> str:
+        if settings.skip_existing_breaks and self.has_existing_break(text):
+            return text
+        pieces = re.split(r"(\\n|\n)", text)
+        changed = False
+        for index in range(0, len(pieces), 2):
+            formatted = self.format_segment(pieces[index], settings)
+            changed = changed or formatted != pieces[index]
+            pieces[index] = formatted
+        return "".join(pieces) if changed else text
+
+    def format_segment(self, text: str, settings: AutoFormatSettings) -> str:
+        if not text.strip() or self.model.measure(text, settings) <= settings.max_width:
+            return text
+        lines: list[str] = []
+        remaining = text
+        guard = 0
+        while remaining and self.model.measure(remaining, settings) > settings.max_width and guard < 16:
+            guard += 1
+            candidates = []
+            for index, char in enumerate(remaining):
+                if char not in {" ", "　"}:
+                    continue
+                visible = self.model.visible_units(remaining[:index], settings)
+                if settings.range_start <= visible <= settings.range_end:
+                    candidates.append(index)
+            if not candidates:
+                break
+            fitting = [index for index in candidates if self.model.measure(remaining[:index], settings) <= settings.max_width]
+            break_at = fitting[-1] if fitting else candidates[0]
+            head = remaining[:break_at].rstrip()
+            tail = remaining[break_at + 1:].lstrip()
+            if not head or not tail:
+                break
+            lines.append(head)
+            remaining = tail
+        if not lines:
+            return text
+        lines.append(remaining)
+        return "\n".join(lines)
+
+
+class AutoFormatDialog(QDialog):
+    PRESETS = [
+        ("Default 14-20 / 208px", {"max_width": 208, "range_start": 14, "range_end": 20, "halfwidth_ascii": True, "skip_existing_breaks": True, "placeholder_max_chars": 20}),
+        ("Short 10-16 / 160px", {"max_width": 160, "range_start": 10, "range_end": 16, "halfwidth_ascii": True, "skip_existing_breaks": True, "placeholder_max_chars": 16}),
+        ("Dialog 12-18 / 184px", {"max_width": 184, "range_start": 12, "range_end": 18, "halfwidth_ascii": True, "skip_existing_breaks": True, "placeholder_max_chars": 18}),
+        ("Wide 18-26 / 224px", {"max_width": 224, "range_start": 18, "range_end": 26, "halfwidth_ascii": True, "skip_existing_breaks": True, "placeholder_max_chars": 20}),
+        ("Reflow existing breaks", {"max_width": 208, "range_start": 14, "range_end": 20, "halfwidth_ascii": True, "skip_existing_breaks": False, "placeholder_max_chars": 20}),
+        ("Full-width ASCII", {"max_width": 208, "range_start": 14, "range_end": 20, "halfwidth_ascii": False, "skip_existing_breaks": True, "placeholder_max_chars": 20}),
+    ]
+
+    def __init__(self, parent: QWidget, owner: object, title: str) -> None:
+        super().__init__(parent)
+        self.owner = owner
+        self.changes: list[AutoFormatChange] = []
+        self.setWindowTitle(title); self.resize(980, 720)
+        layout = QVBoxLayout(self)
+        form = QFormLayout()
+        self.preset = QComboBox()
+        self.preset.addItem("Custom", None)
+        for label, values in self.PRESETS:
+            self.preset.addItem(label, values)
+        self.scope = QComboBox()
+        self.scope.addItem("現在選択中の文字列", "current")
+        self.scope.addItem("現在開いているファイル", "file")
+        self.scope.addItem("検索結果に一致した文字列", "search")
+        self.scope.addItem("選択範囲のみ", "selection")
+        self.font = QComboBox()
+        for font in ("FONT_NORMAL", "FONT_SMALL", "FONT_NARROW", "FONT_NARROWER"):
+            self.font.addItem(font, font)
+        self.max_width = QSpinBox(); self.max_width.setRange(16, 240); self.max_width.setValue(208); self.max_width.setSuffix(" px")
+        self.range_start = QSpinBox(); self.range_start.setRange(1, 999); self.range_start.setValue(14)
+        self.range_end = QSpinBox(); self.range_end.setRange(1, 999); self.range_end.setValue(20)
+        self.placeholder_max_chars = QSpinBox(); self.placeholder_max_chars.setRange(1, 99); self.placeholder_max_chars.setValue(20)
+        self.skip_breaks = QCheckBox("既に \\n がある文字列は処理しない"); self.skip_breaks.setChecked(True)
+        self.halfwidth_ascii = QCheckBox("英数字・記号を半角幅で扱う"); self.halfwidth_ascii.setChecked(True)
+        self.safe_placeholders = QCheckBox("{PLAYER} などの制御変数を最大幅で見積もる"); self.safe_placeholders.setChecked(True)
+        form.addRow("対象", self.scope); form.addRow("フォント", self.font); form.addRow("最大幅", self.max_width)
+        form.addRow("空白探索 開始文字目", self.range_start); form.addRow("空白探索 終了文字目", self.range_end)
+        form.addRow(self.skip_breaks); form.addRow(self.halfwidth_ascii); form.addRow(self.safe_placeholders)
+        form.insertRow(0, "Preset", self.preset)
+        form.addRow("Placeholder max chars", self.placeholder_max_chars)
+        layout.addLayout(form)
+        preview_button = QPushButton("差分プレビュー"); preview_button.clicked.connect(self.preview_changes); layout.addWidget(preview_button)
+        self.preview = QPlainTextEdit(); self.preview.setReadOnly(True); layout.addWidget(self.preview)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("適用")
+        buttons.accepted.connect(self.accept); buttons.rejected.connect(self.reject); layout.addWidget(buttons)
+        self.preset.currentIndexChanged.connect(self.apply_preset)
+        for control in (self.scope, self.font):
+            control.currentIndexChanged.connect(self.preview_changes)
+        for control in (self.max_width, self.range_start, self.range_end, self.placeholder_max_chars):
+            control.valueChanged.connect(self.preview_changes)
+        for control in (self.skip_breaks, self.halfwidth_ascii, self.safe_placeholders):
+            control.stateChanged.connect(self.preview_changes)
+        self.preview_changes()
+
+    def apply_preset(self) -> None:
+        values = self.preset.currentData()
+        if not isinstance(values, dict):
+            self.preview_changes()
+            return
+        self.max_width.setValue(int(values.get("max_width", self.max_width.value())))
+        self.range_start.setValue(int(values.get("range_start", self.range_start.value())))
+        self.range_end.setValue(int(values.get("range_end", self.range_end.value())))
+        self.placeholder_max_chars.setValue(int(values.get("placeholder_max_chars", self.placeholder_max_chars.value())))
+        self.halfwidth_ascii.setChecked(bool(values.get("halfwidth_ascii", self.halfwidth_ascii.isChecked())))
+        self.skip_breaks.setChecked(bool(values.get("skip_existing_breaks", self.skip_breaks.isChecked())))
+        self.preview_changes()
+
+    def settings(self) -> AutoFormatSettings:
+        start = min(self.range_start.value(), self.range_end.value())
+        end = max(self.range_start.value(), self.range_end.value())
+        return AutoFormatSettings(
+            self.scope.currentData(), self.font.currentData(), self.max_width.value(),
+            start, end, self.skip_breaks.isChecked(), self.halfwidth_ascii.isChecked(), self.safe_placeholders.isChecked(),
+            self.placeholder_max_chars.value(),
+        )
+
+    def preview_changes(self) -> None:
+        self.changes = self.owner.preview_auto_format(self.settings())  # type: ignore[attr-defined]
+        if not self.changes:
+            self.preview.setPlainText("No changes.")
+            return
+        chunks = []
+        for change in self.changes:
+            diff = difflib.unified_diff(change.before.splitlines(), change.after.splitlines(), fromfile=change.label + " before", tofile=change.label + " after", lineterm="")
+            chunks.append("\n".join(diff))
+        self.preview.setPlainText("\n\n".join(chunks))
+
+    def accept(self) -> None:
+        self.preview_changes()
+        if self.changes:
+            self.owner.apply_auto_format(self.changes)  # type: ignore[attr-defined]
+        super().accept()
+
+
 @dataclass
 class TextEntry:
     path: Path
@@ -384,8 +747,9 @@ class TranslationTextPanel(QWidget):
         buttons = QHBoxLayout()
         export = QPushButton(); export.clicked.connect(self.export_csv); self._export = export
         import_button = QPushButton(); import_button.clicked.connect(self.import_csv); self._import = import_button
+        format_button = QPushButton("自動整形"); format_button.clicked.connect(self.open_auto_format); self._format = format_button
         save = QPushButton(); save.clicked.connect(self.save); self._save = save
-        buttons.addWidget(export); buttons.addWidget(import_button); buttons.addStretch(); buttons.addWidget(save)
+        buttons.addWidget(export); buttons.addWidget(import_button); buttons.addWidget(format_button); buttons.addStretch(); buttons.addWidget(save)
         layout.addLayout(buttons)
         self.retranslate()
 
@@ -394,7 +758,7 @@ class TranslationTextPanel(QWidget):
         self.untranslated.setText(tr("untranslated", lang)); self.changed.setText(tr("dirty", lang))
         self._clear_button.setText(tr("clear", lang)); self.original_label.setText(tr("original", lang))
         self.edited_label.setText(tr("edited", lang)); self._export.setText(tr("export", lang))
-        self._import.setText(tr("import", lang)); self._save.setText(tr("save", lang))
+        self._import.setText(tr("import", lang)); self._format.setText("自動整形" if lang == "ja" else "Auto Format"); self._save.setText(tr("save", lang))
 
     def load(self) -> None:
         if not self.window.root_valid():
@@ -477,6 +841,55 @@ class TranslationTextPanel(QWidget):
         if not self.current:
             return
         DiffDialog(self, f"Diff: {self.current.symbol}", self.current.original, self.current.current).exec()
+
+    def open_auto_format(self) -> None:
+        AutoFormatDialog(self, self, "テキスト自動整形").exec()
+
+    def selected_text_range(self) -> tuple[int, int, str] | None:
+        cursor = self.editor.textCursor()
+        if not cursor.hasSelection():
+            return None
+        start, end = cursor.selectionStart(), cursor.selectionEnd()
+        return start, end, cursor.selectedText().replace("\u2029", "\n")
+
+    def format_entries_for_scope(self, scope: str) -> list[TextEntry]:
+        if scope == "current":
+            return [self.current] if self.current else []
+        if scope == "file":
+            return [entry for entry in self.entries if self.current and entry.path == self.current.path]
+        if scope == "search":
+            if not self.search.text().strip() and not self.file_filter.text().strip() and not self.untranslated.isChecked() and not self.changed.isChecked():
+                return []
+            return self.filtered()
+        return []
+
+    def preview_auto_format(self, settings: AutoFormatSettings) -> list[AutoFormatChange]:
+        formatter = TextAutoFormatter(self.window.root)
+        changes: list[AutoFormatChange] = []
+        if settings.scope == "selection":
+            selected = self.selected_text_range()
+            if not self.current or not selected:
+                return []
+            start, end, before = selected
+            after = formatter.format_text(before, settings)
+            return [AutoFormatChange(f"{self.current.symbol} selection", before, after, self.current, (start, end))] if after != before else []
+        for entry in self.format_entries_for_scope(settings.scope):
+            after = formatter.format_text(entry.current, settings)
+            if after != entry.current:
+                changes.append(AutoFormatChange(f"{entry.symbol} ({entry.file_name}:{entry.line})", entry.current, after, entry))
+        return changes
+
+    def apply_auto_format(self, changes: list[AutoFormatChange]) -> None:
+        for change in changes:
+            if change.selection and change.target is self.current:
+                start, end = change.selection
+                cursor = self.editor.textCursor()
+                cursor.setPosition(start); cursor.setPosition(end, QTextCursor.MoveMode.KeepAnchor); cursor.insertText(change.after)
+            elif isinstance(change.target, TextEntry):
+                change.target.current = change.after
+        if self.current:
+            self.loading = True; self.editor.setPlainText(self.current.current); self.loading = False
+        self.refresh(); self.window.status(f"Auto formatted {len(changes)} text item(s)")
 
     def export_csv(self) -> None:
         if not self.entries: return
@@ -756,7 +1169,7 @@ class EventBrowserPanel(QWidget):
         super().__init__(); self.window = window; self.translation = translation; self.scripts: list[EventScript] = []; self.inc_texts: list[EventTextEntry] = []; self.pory_texts: list[PoryTextEntry] = []; self.inc_contents: dict[Path, str] = {}; self.definitions: dict[TextIdentity, TextTarget] = {}; self.symbol_index: dict[str, list[TextIdentity]] = {}; self.uses_by_target: dict[TextIdentity, list[EventTextUse]] = {}; self.text_rows: list[TextIdentity] = []; self.current_id: TextIdentity | None = None; self.loading = False; self.edited_source_ids: set[TextIdentity] = set()
         layout = QVBoxLayout(self); filters = QHBoxLayout(); self.search = QLineEdit(); self.search.setPlaceholderText("ラベル名・本文・ファイル・イベントを検索"); self.search.textChanged.connect(self.refresh); clear = QPushButton("クリア"); clear.clicked.connect(self.search.clear); self.count = QLabel(); filters.addWidget(self.search); filters.addWidget(clear); filters.addWidget(self.count); filters.addStretch(); layout.addLayout(filters)
         split = QSplitter(Qt.Orientation.Horizontal); left = QSplitter(Qt.Orientation.Vertical); self.text_table = QTableWidget(0, 7); self.text_table.setHorizontalHeaderLabels(["種別", "ラベル", "本文", "ファイル", "行", "使用", "状態"]); self.text_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows); self.text_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers); self.text_table.itemSelectionChanged.connect(self.select_text_row); left.addWidget(self.text_table); self.tree = QTreeWidget(); self.tree.setHeaderLabels(["イベント構造", "種類"]); self.tree.itemSelectionChanged.connect(self.select_tree_item); left.addWidget(self.tree); left.setSizes([460, 420]); split.addWidget(left)
-        detail = QWidget(); detail_layout = QVBoxLayout(detail); self.detail = QLabel("テキストまたはイベントを選択してください。"); self.detail.setWordWrap(True); detail_layout.addWidget(self.detail); detail_layout.addWidget(QLabel("イベント本文 / 相互参照")); self.context = QPlainTextEdit(); self.context.setReadOnly(True); self.context.setMaximumHeight(160); detail_layout.addWidget(self.context); detail_layout.addWidget(QLabel("元のテキスト（INC の末尾 $ は非表示）")); self.original = QPlainTextEdit(); self.original.setReadOnly(True); self.original.setMaximumHeight(110); detail_layout.addWidget(self.original); detail_layout.addWidget(QLabel("翻訳テキスト")); self.editor = QPlainTextEdit(); self.editor.setEnabled(False); self.editor.textChanged.connect(self.edit_changed); detail_layout.addWidget(self.editor); detail_layout.addWidget(QLabel("使用箇所 / 使用テキスト")); self.references = QListWidget(); self.references.itemDoubleClicked.connect(self.open_reference); detail_layout.addWidget(self.references); controls = QHBoxLayout(); revert = QPushButton("元に戻す"); revert.clicked.connect(self.revert); self.diff_button = QPushButton("差分"); self.diff_button.clicked.connect(self.show_diff); self.save_button = QPushButton("保存"); self.save_button.clicked.connect(self.save); controls.addWidget(revert); controls.addWidget(self.diff_button); controls.addStretch(); controls.addWidget(self.save_button); detail_layout.addLayout(controls); split.addWidget(detail); split.setSizes([850, 650]); layout.addWidget(split)
+        detail = QWidget(); detail_layout = QVBoxLayout(detail); self.detail = QLabel("テキストまたはイベントを選択してください。"); self.detail.setWordWrap(True); detail_layout.addWidget(self.detail); detail_layout.addWidget(QLabel("イベント本文 / 相互参照")); self.context = QPlainTextEdit(); self.context.setReadOnly(True); self.context.setMaximumHeight(160); detail_layout.addWidget(self.context); detail_layout.addWidget(QLabel("元のテキスト（INC の末尾 $ は非表示）")); self.original = QPlainTextEdit(); self.original.setReadOnly(True); self.original.setMaximumHeight(110); detail_layout.addWidget(self.original); detail_layout.addWidget(QLabel("翻訳テキスト")); self.editor = QPlainTextEdit(); self.editor.setEnabled(False); self.editor.textChanged.connect(self.edit_changed); detail_layout.addWidget(self.editor); detail_layout.addWidget(QLabel("使用箇所 / 使用テキスト")); self.references = QListWidget(); self.references.itemDoubleClicked.connect(self.open_reference); detail_layout.addWidget(self.references); controls = QHBoxLayout(); revert = QPushButton("元に戻す"); revert.clicked.connect(self.revert); self.diff_button = QPushButton("差分"); self.diff_button.clicked.connect(self.show_diff); self.format_button = QPushButton("自動整形"); self.format_button.clicked.connect(self.open_auto_format); self.save_button = QPushButton("保存"); self.save_button.clicked.connect(self.save); controls.addWidget(revert); controls.addWidget(self.diff_button); controls.addWidget(self.format_button); controls.addStretch(); controls.addWidget(self.save_button); detail_layout.addLayout(controls); split.addWidget(detail); split.setSizes([850, 650]); layout.addWidget(split)
 
     @staticmethod
     def target_kind(target: TextTarget) -> str:
@@ -773,7 +1186,7 @@ class EventBrowserPanel(QWidget):
         return not isinstance(target, PoryTextEntry) and (not isinstance(target, EventTextEntry) or target.supported)
 
     def retranslate(self) -> None:
-        self.save_button.setText(tr("save", self.window.lang))
+        self.format_button.setText("自動整形" if self.window.lang == "ja" else "Auto Format"); self.save_button.setText(tr("save", self.window.lang))
 
     def add_definition(self, target: TextTarget) -> None:
         key = self.target_id(target); self.definitions[key] = target; self.symbol_index.setdefault(target.symbol, []).append(key)
@@ -886,6 +1299,68 @@ class EventBrowserPanel(QWidget):
         if not target: return
         target.current = target.original; self.edited_source_ids.discard(self.current_id); self.loading = True; self.editor.setPlainText(target.current); self.loading = False; self.refresh()
 
+    def open_auto_format(self) -> None:
+        AutoFormatDialog(self, self, "イベントテキスト自動整形").exec()
+
+    def selected_text_range(self) -> tuple[int, int, str] | None:
+        cursor = self.editor.textCursor()
+        if not cursor.hasSelection():
+            return None
+        start, end = cursor.selectionStart(), cursor.selectionEnd()
+        return start, end, cursor.selectedText().replace("\u2029", "\n")
+
+    def editable_keys_for_scope(self, scope: str) -> list[TextIdentity]:
+        if scope == "current":
+            return [self.current_id] if self.current_id and self.current_id in self.definitions and self.target_editable(self.definitions[self.current_id]) else []
+        if scope == "file":
+            if not self.current_id or self.current_id not in self.definitions:
+                return []
+            current_path = self.definitions[self.current_id].path
+            return [key for key, target in self.definitions.items() if self.target_editable(target) and target.path == current_path]
+        if scope == "search":
+            query = self.search.text().casefold().strip()
+            if not query:
+                return []
+            return [key for key in self.text_rows if key in self.definitions and self.target_editable(self.definitions[key]) and self.target_matches(self.definitions[key], query)]
+        return []
+
+    def preview_auto_format(self, settings: AutoFormatSettings) -> list[AutoFormatChange]:
+        formatter = TextAutoFormatter(self.window.root)
+        if settings.scope == "selection":
+            selected = self.selected_text_range()
+            if not self.current_id or self.current_id not in self.definitions or not selected:
+                return []
+            target = self.definitions[self.current_id]
+            if not self.target_editable(target):
+                return []
+            start, end, before = selected
+            after = formatter.format_text(before, settings)
+            return [AutoFormatChange(f"{target.symbol} selection", before, after, target, (start, end))] if after != before else []
+        changes: list[AutoFormatChange] = []
+        for key in self.editable_keys_for_scope(settings.scope):
+            target = self.definitions[key]
+            after = formatter.format_text(target.current, settings)
+            if after != target.current:
+                changes.append(AutoFormatChange(f"{target.symbol} ({target.file_name}:{target.line})", target.current, after, target))
+        return changes
+
+    def apply_auto_format(self, changes: list[AutoFormatChange]) -> None:
+        for change in changes:
+            target = change.target
+            if not isinstance(target, (TextEntry, EventTextEntry)):
+                continue
+            if change.selection:
+                start, end = change.selection
+                target.current = target.current[:start] + change.after + target.current[end:]
+            else:
+                target.current = change.after
+            if isinstance(target, TextEntry):
+                self.edited_source_ids.add(self.target_id(target))
+        if self.current_id and self.current_id in self.definitions:
+            current = self.definitions[self.current_id]
+            self.loading = True; self.editor.setPlainText(current.current); self.loading = False
+        self.refresh(); self.window.status(f"Auto formatted {len(changes)} event text item(s)")
+
     def save_inc_texts(self) -> int:
         dirty = [entry for entry in self.inc_texts if entry.dirty]
         grouped: dict[Path, list[EventTextEntry]] = {}
@@ -972,6 +1447,67 @@ class SourceRecord:
     end: int
     block: str
     values: dict[str, str] = field(default_factory=dict)
+
+
+DESIGNATED_FIELD_RE = re.compile(r"\.[A-Za-z_][A-Za-z0-9_]*\s*=\s*")
+CONCATENATED_DESIGNATORS_RE = re.compile(r"\.[A-Za-z_][A-Za-z0-9_]*\s*=.*\.[A-Za-z_][A-Za-z0-9_]*\s*=")
+
+
+def ensure_designated_initializer_commas(block: str) -> str:
+    """Ensure every designated initializer field in one record ends with a comma."""
+    insertions: list[int] = []
+    pos = 0
+    while True:
+        match = DESIGNATED_FIELD_RE.search(block, pos)
+        if not match:
+            break
+        scan = match.end()
+        depth = 0
+        value_end = scan
+        while scan < len(block):
+            if block.startswith("//", scan) or block.startswith("/*", scan):
+                insertions.append(value_end)
+                break
+            char = block[scan]
+            if char in "\"'":
+                scan = skip_string(block, scan, char)
+                value_end = scan
+                continue
+            if char in "({[":
+                depth += 1
+                value_end = scan + 1
+            elif char in ")}]":
+                if depth == 0:
+                    insertions.append(value_end)
+                    break
+                depth -= 1
+                value_end = scan + 1
+            elif char == "," and depth == 0:
+                scan += 1
+                break
+            elif depth == 0 and char == "." and DESIGNATED_FIELD_RE.match(block, scan):
+                insertions.append(value_end)
+                break
+            elif not char.isspace():
+                value_end = scan + 1
+            scan += 1
+        pos = max(scan, match.end())
+    updated = block
+    for index in sorted(set(insertions), reverse=True):
+        updated = updated[:index] + "," + updated[index:]
+    return updated
+
+
+def concatenated_designator_lines(source: str) -> list[tuple[int, str]]:
+    return [(index, line.strip()) for index, line in enumerate(source.splitlines(), 1) if CONCATENATED_DESIGNATORS_RE.search(line)]
+
+
+def assert_no_concatenated_designators(path: Path, source: str, root: Path | None = None) -> None:
+    bad_lines = concatenated_designator_lines(source)
+    if bad_lines:
+        base = root if root is not None else Path.cwd()
+        sample = "\n".join(f"{rel(base, path)}:{line_no}: {line[:160]}" for line_no, line in bad_lines[:8])
+        raise RuntimeError("Multiple designated initializers were found on one line; save was aborted.\n" + sample)
 
 
 def raw_field(block: str, name: str) -> tuple[int, int, str] | None:
@@ -2388,6 +2924,17 @@ def display_enum_token(value: str, prefix: str, fallback: str) -> str:
     return found.group(1) if found else fallback
 
 
+def unique_tokens(tokens: Iterable[str], keep_none: bool = True) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for token in tokens:
+        if not keep_none and token.endswith("_NONE"):
+            continue
+        if token not in seen:
+            seen.add(token); result.append(token)
+    return result
+
+
 def display_integer(value: str) -> int:
     conditional = re.search(r"\?\s*(-?\d+)", value)
     if conditional:
@@ -2416,7 +2963,10 @@ def replace_record_fields(record: SourceRecord, values: dict[str, str], strings:
             if value != raw[2]:
                 replacements.append((raw[0], raw[1], value))
         elif value not in {"", "FALSE", "0"}:
-            additions.append(f"        .{field_name} = {value},\n")
+            if field_name in strings:
+                additions.append(f"        .{field_name} = _({quote_c_text(value)}),\n")
+            else:
+                additions.append(f"        .{field_name} = {value},\n")
     updated = record.block
     for start, end, value in sorted(replacements, reverse=True):
         updated = updated[:start] + value + updated[end:]
@@ -2897,20 +3447,32 @@ class MoveStudioPanel(RecordStudioBase):
 
 
 FRONTIER_MON_FIELDS = [
-    "species", "moves", "heldItem", "ev", "iv", "ability", "lvl", "ball", "friendship",
+    "nickname", "species", "moves", "heldItem", "ev", "iv", "ability", "lvl", "ball", "friendship",
     "nature", "gender", "isShiny", "teraType", "gigantamaxFactor", "shouldUseDynamax",
     "dynamaxLevel", "tags",
 ]
 NATURE_LABELS = {
-    "NATURE_HARDY": "Hardy", "NATURE_LONELY": "Lonely", "NATURE_BRAVE": "Brave",
-    "NATURE_ADAMANT": "Adamant", "NATURE_NAUGHTY": "Naughty", "NATURE_BOLD": "Bold",
-    "NATURE_DOCILE": "Docile", "NATURE_RELAXED": "Relaxed", "NATURE_IMPISH": "Impish",
-    "NATURE_LAX": "Lax", "NATURE_TIMID": "Timid", "NATURE_HASTY": "Hasty",
-    "NATURE_SERIOUS": "Serious", "NATURE_JOLLY": "Jolly", "NATURE_NAIVE": "Naive",
-    "NATURE_MODEST": "Modest", "NATURE_MILD": "Mild", "NATURE_QUIET": "Quiet",
-    "NATURE_BASHFUL": "Bashful", "NATURE_RASH": "Rash", "NATURE_CALM": "Calm",
-    "NATURE_GENTLE": "Gentle", "NATURE_SASSY": "Sassy", "NATURE_CAREFUL": "Careful",
-    "NATURE_QUIRKY": "Quirky",
+    "NATURE_HARDY": "がんばりや", "NATURE_LONELY": "さみしがり", "NATURE_BRAVE": "ゆうかん",
+    "NATURE_ADAMANT": "いじっぱり", "NATURE_NAUGHTY": "やんちゃ", "NATURE_BOLD": "ずぶとい",
+    "NATURE_DOCILE": "すなお", "NATURE_RELAXED": "のんき", "NATURE_IMPISH": "わんぱく",
+    "NATURE_LAX": "のうてんき", "NATURE_TIMID": "おくびょう", "NATURE_HASTY": "せっかち",
+    "NATURE_SERIOUS": "まじめ", "NATURE_JOLLY": "ようき", "NATURE_NAIVE": "むじゃき",
+    "NATURE_MODEST": "ひかえめ", "NATURE_MILD": "おっとり", "NATURE_QUIET": "れいせい",
+    "NATURE_BASHFUL": "てれや", "NATURE_RASH": "うっかりや", "NATURE_CALM": "おだやか",
+    "NATURE_GENTLE": "おとなしい", "NATURE_SASSY": "なまいき", "NATURE_CAREFUL": "しんちょう",
+    "NATURE_QUIRKY": "きまぐれ",
+}
+BALL_LABELS = {
+    "BALL_STRANGE": "ストレンジボール", "BALL_POKE": "モンスターボール", "BALL_GREAT": "スーパーボール",
+    "BALL_ULTRA": "ハイパーボール", "BALL_MASTER": "マスターボール", "BALL_PREMIER": "プレミアボール",
+    "BALL_HEAL": "ヒールボール", "BALL_NET": "ネットボール", "BALL_NEST": "ネストボール",
+    "BALL_DIVE": "ダイブボール", "BALL_DUSK": "ダークボール", "BALL_TIMER": "タイマーボール",
+    "BALL_QUICK": "クイックボール", "BALL_REPEAT": "リピートボール", "BALL_LUXURY": "ゴージャスボール",
+    "BALL_LEVEL": "レベルボール", "BALL_LURE": "ルアーボール", "BALL_MOON": "ムーンボール",
+    "BALL_FRIEND": "フレンドボール", "BALL_LOVE": "ラブラブボール", "BALL_FAST": "スピードボール",
+    "BALL_HEAVY": "ヘビーボール", "BALL_DREAM": "ドリームボール", "BALL_SAFARI": "サファリボール",
+    "BALL_SPORT": "コンペボール", "BALL_PARK": "パークボール", "BALL_BEAST": "ウルトラボール",
+    "BALL_CHERISH": "プレシャスボール", "BALL_RANDOM": "ランダム",
 }
 
 
@@ -2959,8 +3521,9 @@ class BattleFrontierPanel(QWidget):
         self.macros: list[FrontierMacro] = []; self.current_macro: FrontierMacro | None = None; self.macro_original = ""
         self.factory_path = Path(); self.factory_source = ""; self.factory_ranges: list[FactoryRangeRecord] = []; self.factory_ivs: list[FactoryIvRecord] = []; self.range_states: dict[int, tuple[str, str]] = {}; self.iv_states: dict[int, tuple[int, int]] = {}
         self.species_names: dict[str, str] = {}; self.move_names: dict[str, str] = {}; self.item_names: dict[str, str] = {}; self.ability_names: dict[str, str] = {}
+        self.species_abilities: dict[str, list[str]] = {}; self.item_pockets: dict[str, str] = {}; self.item_hold_effects: dict[str, str] = {}
         self.species_values: dict[str, int] = {}; self.move_values: dict[str, int] = {}; self.item_values: dict[str, int] = {}; self.frontier_values: dict[str, int] = {}; self.frontier_by_value: dict[int, str] = {}
-        self.species_learnsets: dict[str, set[str]] = {}; self.mon_usage_counts: dict[str, int] = {}; self.factory_usage: set[str] = set()
+        self.species_learnsets: dict[str, set[str]] = {}; self.species_move_sources: dict[str, dict[str, set[str]]] = {}; self.mon_usage_counts: dict[str, int] = {}; self.factory_usage: set[str] = set()
         self.build()
 
     def build(self) -> None:
@@ -2974,8 +3537,11 @@ class BattleFrontierPanel(QWidget):
         self.mon_table = QTableWidget(0, 6); self.mon_table.setHorizontalHeaderLabels(["No.", "Frontier ID", "Species", "Item", "Use", "Factory"]); self.mon_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows); self.mon_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers); self.mon_table.itemSelectionChanged.connect(self.select_mon); left_layout.addWidget(self.mon_table); split.addWidget(left)
         right = QWidget(); right_layout = QVBoxLayout(right); self.mon_summary = QLabel(); self.mon_summary.setStyleSheet("font-size: 18px; font-weight: 700;"); right_layout.addWidget(self.mon_summary)
         form_tabs = QTabWidget(); basic = QWidget(); form = QFormLayout(basic)
-        self.mon_species = self.combo(); self.mon_item = self.combo(); self.mon_ability = self.combo(); self.mon_nature = self.combo(); self.mon_ball = self.combo(); self.mon_gender = self.combo(); self.mon_level = self.spin(0, 100); self.mon_friendship = self.spin(0, 255)
-        for label, control in (("Species", self.mon_species), ("Held item", self.mon_item), ("Ability", self.mon_ability), ("Nature", self.mon_nature), ("Ball", self.mon_ball), ("Gender", self.mon_gender), ("Level override", self.mon_level), ("Friendship", self.mon_friendship)): form.addRow(label, control)
+        self.mon_species = self.combo(); self.mon_nickname = QLineEdit(); self.mon_item_category = QComboBox(); self.mon_item_filter = QLineEdit(); self.mon_item = self.combo(); self.mon_ability = self.combo(); self.mon_nature = self.combo(); self.mon_ball = self.combo(); self.mon_gender = self.combo(); self.mon_level = self.spin(0, 100); self.mon_friendship = self.spin(0, 255)
+        self.mon_nickname.setPlaceholderText("空欄なら種族名"); self.mon_item_filter.setPlaceholderText("アイテム名 / ITEM_ / 効果で検索")
+        for label, value in (("すべて", "all"), ("効果あり", "hold"), ("Zクリスタル", "z"), ("メガストーン", "mega"), ("きのみ", "berry")):
+            self.mon_item_category.addItem(label, value)
+        for label, control in (("Species", self.mon_species), ("Nickname", self.mon_nickname), ("Item group", self.mon_item_category), ("Item search", self.mon_item_filter), ("Held item", self.mon_item), ("Ability", self.mon_ability), ("Nature", self.mon_nature), ("Ball", self.mon_ball), ("Gender", self.mon_gender), ("Level override", self.mon_level), ("Friendship", self.mon_friendship)): form.addRow(label, control)
         form_tabs.addTab(basic, "Basic")
         moves = QWidget(); moves_layout = QVBoxLayout(moves); self.move_filter_label = QLabel(); moves_layout.addWidget(self.move_filter_label); self.mon_moves = [self.combo() for _ in range(4)]
         for index, combo in enumerate(self.mon_moves, 1):
@@ -2989,8 +3555,9 @@ class BattleFrontierPanel(QWidget):
         for label, control in (("Tera type", self.mon_tera), ("Dynamax", self.mon_dmax), ("Dynamax level", self.mon_dmax_level), ("Gigantamax", self.mon_gmax), ("Shiny", self.mon_shiny), ("Tags", self.mon_tags)): gimmick_form.addRow(label, control)
         form_tabs.addTab(gimmick, "Gimmick")
         right_layout.addWidget(form_tabs); buttons = QHBoxLayout(); diff = QPushButton("Diff"); diff.clicked.connect(self.show_mon_diff); save = QPushButton("Save pool"); save.clicked.connect(self.save_mons); buttons.addStretch(); buttons.addWidget(diff); buttons.addWidget(save); right_layout.addLayout(buttons); split.addWidget(right); split.setSizes([720, 760]); layout.addWidget(split); self.tabs.addTab(page, "Pokemon pool")
-        self.mon_species.currentIndexChanged.connect(self.refresh_move_choices)
-        for control in [self.mon_species, self.mon_item, self.mon_ability, self.mon_nature, self.mon_ball, self.mon_gender, self.mon_level, self.mon_friendship, self.mon_tera, self.mon_dmax, self.mon_dmax_level, self.mon_gmax, self.mon_shiny, self.mon_tags, *self.mon_moves, *self.ev_boxes, *self.iv_boxes]:
+        self.mon_species.currentIndexChanged.connect(self.refresh_species_dependent_choices)
+        self.mon_item_filter.textChanged.connect(self.refresh_item_choices); self.mon_item_category.currentIndexChanged.connect(self.refresh_item_choices)
+        for control in [self.mon_species, self.mon_nickname, self.mon_item, self.mon_ability, self.mon_nature, self.mon_ball, self.mon_gender, self.mon_level, self.mon_friendship, self.mon_tera, self.mon_dmax, self.mon_dmax_level, self.mon_gmax, self.mon_shiny, self.mon_tags, *self.mon_moves, *self.ev_boxes, *self.iv_boxes]:
             self.watch(control, self.mon_changed)
 
     def build_trainers_tab(self) -> None:
@@ -3049,22 +3616,24 @@ class BattleFrontierPanel(QWidget):
     def load_reference_data(self) -> None:
         root = self.window.root
         species_paths = list((root / "src/data/pokemon/species_info").glob("*_families.h")) + [root / "src/data/pokemon/species_info.h"]
-        species_records, _ = indexed_records(root, [path for path in species_paths if path.exists()], "SPECIES_", ["speciesName", "levelUpLearnset", "eggMoveLearnset", "teachableLearnset"])
+        species_records, _ = indexed_records(root, [path for path in species_paths if path.exists()], "SPECIES_", ["speciesName", "abilities", "levelUpLearnset", "eggMoveLearnset", "teachableLearnset"])
         move_records, _ = indexed_records(root, [root / "src/data/moves_info.h"], "MOVE_", ["name"])
-        item_records, _ = indexed_records(root, [root / "src/data/items.h"], "ITEM_", ["name"])
+        item_records, _ = indexed_records(root, [root / "src/data/items.h"], "ITEM_", ["name", "pocket", "holdEffect"])
         ability_records, _ = indexed_records(root, [root / "src/data/abilities.h"], "ABILITY_", ["name"])
         self.species_values = enum_values(root / "include/constants/species.h", "SPECIES_"); self.move_values = enum_values(root / "include/constants/moves.h", "MOVE_"); self.item_values = enum_values(root / "include/constants/items.h", "ITEM_")
         self.species_names = {record.key: string_from_record(record, "speciesName") for record in species_records}; self.move_names = {record.key: string_from_record(record, "name") for record in move_records}; self.item_names = {record.key: string_from_record(record, "name") or record.key for record in item_records}; self.ability_names = {record.key: string_from_record(record, "name") for record in ability_records}
+        self.species_abilities = {record.key: unique_tokens(re.findall(r"\bABILITY_[A-Z0-9_]+\b", record.values.get("abilities", "")), keep_none=False) or ["ABILITY_NONE"] for record in species_records}
+        self.item_pockets = {record.key: record.values.get("pocket", "") for record in item_records}; self.item_hold_effects = {record.key: record.values.get("holdEffect", "HOLD_EFFECT_NONE") for record in item_records}
         self.frontier_values = define_values(root / "include/constants/battle_frontier_mons.h", ("FRONTIER_MON_", "FRONTIER_MONS_", "NUM_FRONTIER_MONS"))
         self.frontier_by_value = {value: key for key, value in self.frontier_values.items() if key.startswith("FRONTIER_MON_")}
         self.populate_static_combos(); self.species_learnsets = self.build_species_learnsets(species_records)
 
     def populate_static_combos(self) -> None:
         self.fill_combo(self.mon_species, self.species_values, self.species_names, "SPECIES_NONE")
-        self.fill_combo(self.mon_item, self.item_values, self.item_names, "ITEM_NONE")
-        self.fill_combo(self.mon_ability, enum_values(self.window.root / "include/constants/abilities.h", "ABILITY_"), self.ability_names, "ABILITY_NONE")
+        self.refresh_item_choices("ITEM_NONE")
+        self.refresh_ability_choices("ABILITY_NONE")
         self.fill_combo(self.mon_nature, define_values(self.window.root / "include/constants/pokemon.h", ("NATURE_",)), NATURE_LABELS, "NATURE_HARDY")
-        self.fill_combo(self.mon_ball, enum_values(self.window.root / "include/constants/pokeball.h", "BALL_"), {}, "BALL_POKE")
+        self.fill_combo(self.mon_ball, enum_values(self.window.root / "include/constants/pokeball.h", "BALL_"), BALL_LABELS, "BALL_POKE")
         self.mon_gender.blockSignals(True); self.mon_gender.clear()
         for label, value in (("Default", "0"), ("Male", "TRAINER_MON_MALE"), ("Female", "TRAINER_MON_FEMALE"), ("Random gender", "TRAINER_MON_RANDOM_GENDER")): self.mon_gender.addItem(f"{label} [{value}]", value)
         self.mon_gender.blockSignals(False)
@@ -3074,6 +3643,81 @@ class BattleFrontierPanel(QWidget):
         range_entries = {key: value for key, value in self.frontier_values.items() if key.startswith(("FRONTIER_MON_", "FRONTIER_MONS_", "NUM_FRONTIER_MONS"))}
         self.fill_combo(self.range_start, range_entries, {}, "FRONTIER_MON_SUNKERN"); self.fill_combo(self.range_end, range_entries, {}, "FRONTIER_MON_SUNKERN")
 
+    def item_allowed_for_frontier(self, key: str) -> bool:
+        if key == "ITEM_NONE":
+            return True
+        pocket = self.item_pockets.get(key, "")
+        if pocket in {"POCKET_TM_HM", "POCKET_KEY_ITEMS"}:
+            return False
+        if pocket == "POCKET_BERRIES":
+            return True
+        return self.item_hold_effects.get(key, "HOLD_EFFECT_NONE") not in {"", "HOLD_EFFECT_NONE"}
+
+    def item_matches_category(self, key: str, category: str) -> bool:
+        if key == "ITEM_NONE":
+            return category == "all"
+        pocket = self.item_pockets.get(key, "")
+        hold = self.item_hold_effects.get(key, "HOLD_EFFECT_NONE")
+        if category == "berry":
+            return pocket == "POCKET_BERRIES"
+        if category == "z":
+            return hold == "HOLD_EFFECT_Z_CRYSTAL" or "_Z" in key or "Z_CRYSTAL" in key
+        if category == "mega":
+            return hold == "HOLD_EFFECT_MEGA_STONE"
+        if category == "hold":
+            return hold not in {"", "HOLD_EFFECT_NONE"} or pocket == "POCKET_BERRIES"
+        return True
+
+    def item_search_text(self, key: str) -> str:
+        return " ".join([key, self.item_names.get(key, ""), self.item_pockets.get(key, ""), self.item_hold_effects.get(key, "")]).casefold()
+
+    def refresh_item_choices(self, current: object | None = None) -> None:
+        if not hasattr(self, "mon_item"):
+            return
+        selected = current if isinstance(current, str) and current.startswith("ITEM_") else self.combo_value(self.mon_item)
+        category = self.mon_item_category.currentData() if hasattr(self, "mon_item_category") else "all"
+        query = self.mon_item_filter.text().casefold().strip() if hasattr(self, "mon_item_filter") else ""
+        keys = []
+        for key in self.item_values:
+            if not self.item_allowed_for_frontier(key):
+                continue
+            if not self.item_matches_category(key, category):
+                continue
+            if query and query not in self.item_search_text(key):
+                continue
+            keys.append(key)
+        keys = sorted(keys, key=lambda key: (self.item_names.get(key, key).casefold(), self.item_values.get(key, 0)))
+        if isinstance(selected, str) and selected and selected not in keys and selected in self.item_values:
+            keys.append(selected)
+        self.mon_item.blockSignals(True); self.mon_item.clear(); self.mon_item.setEditable(True)
+        for key in keys:
+            extra = "" if self.item_allowed_for_frontier(key) else " / 範囲外"
+            self.mon_item.addItem(f"{self.item_names.get(key, key)}{extra} [{key}]", key)
+        self.set_combo(self.mon_item, selected if isinstance(selected, str) and selected else "ITEM_NONE")
+        self.mon_item.blockSignals(False)
+
+    def refresh_ability_choices(self, current: object | None = None) -> None:
+        if not hasattr(self, "mon_ability"):
+            return
+        selected = current if isinstance(current, str) and current.startswith("ABILITY_") else self.combo_value(self.mon_ability)
+        species = self.combo_value(self.mon_species) if hasattr(self, "mon_species") else "SPECIES_NONE"
+        keys = list(self.species_abilities.get(species, ["ABILITY_NONE"]))
+        if isinstance(selected, str) and selected and selected not in keys:
+            if self.loading:
+                keys.append(selected)
+            else:
+                selected = keys[0] if keys else "ABILITY_NONE"
+        self.mon_ability.blockSignals(True); self.mon_ability.clear()
+        for key in keys:
+            extra = "" if key in self.species_abilities.get(species, keys) else " / 種族外"
+            self.mon_ability.addItem(f"{self.ability_names.get(key, key)}{extra} [{key}]", key)
+        self.set_combo(self.mon_ability, selected if isinstance(selected, str) and selected else (keys[0] if keys else "ABILITY_NONE"))
+        self.mon_ability.blockSignals(False)
+
+    def refresh_species_dependent_choices(self) -> None:
+        self.refresh_ability_choices()
+        self.refresh_move_choices()
+
     def fill_combo(self, combo: QComboBox, values: dict[str, int], labels: dict[str, str], fallback: str) -> None:
         combo.blockSignals(True); editable = combo.isEditable(); combo.clear(); combo.setEditable(editable)
         for key, _value in sorted(values.items(), key=lambda item: item[1]):
@@ -3082,17 +3726,36 @@ class BattleFrontierPanel(QWidget):
         combo.blockSignals(False)
 
     def build_species_learnsets(self, species_records: list[SourceRecord]) -> dict[str, set[str]]:
-        root = self.window.root / "src/data/pokemon"; sources: dict[Path, str] = {}
-        paths = sorted((root / "level_up_learnsets").glob("*.h")) + [root / "egg_moves.h", root / "teachable_learnsets.h"]
-        for path in paths:
-            if path.exists(): sources[path] = read_utf8(path)
-        indexed: dict[str, set[str]] = {}
-        pattern = re.compile(r"\b([A-Za-z0-9_]+)\[\]\s*=\s*\{(.*?)(?:\n\s*\};)", re.S)
-        for source in sources.values():
-            for match in pattern.finditer(source):
-                moves = {move for move in re.findall(r"\bMOVE_[A-Z0-9_]+\b", match.group(2)) if move not in {"MOVE_NONE", "MOVE_UNAVAILABLE"}}
-                indexed[match.group(1)] = moves
-        return {record.key: set().union(*(indexed.get(record.values.get(field, ""), set()) for field in ("levelUpLearnset", "eggMoveLearnset", "teachableLearnset"))) for record in species_records}
+        root = self.window.root / "src/data/pokemon"
+
+        def parse_arrays(paths: Iterable[Path]) -> dict[str, set[str]]:
+            indexed: dict[str, set[str]] = {}
+            pattern = re.compile(r"\b([A-Za-z0-9_]+)\[\]\s*=\s*\{(.*?)(?:\n\s*\};)", re.S)
+            for path in paths:
+                if not path.exists():
+                    continue
+                source = read_utf8(path)
+                for match in pattern.finditer(source):
+                    moves = {move for move in re.findall(r"\bMOVE_[A-Z0-9_]+\b", match.group(2)) if move not in {"MOVE_NONE", "MOVE_UNAVAILABLE"}}
+                    indexed[match.group(1)] = moves
+            return indexed
+
+        indexed_by_source = {
+            "level": parse_arrays(sorted((root / "level_up_learnsets").glob("*.h"))),
+            "egg": parse_arrays([root / "egg_moves.h"]),
+            "teachable": parse_arrays([root / "teachable_learnsets.h"]),
+        }
+        self.species_move_sources = {}
+        result: dict[str, set[str]] = {}
+        for record in species_records:
+            groups = {
+                "level": indexed_by_source["level"].get(record.values.get("levelUpLearnset", ""), set()),
+                "egg": indexed_by_source["egg"].get(record.values.get("eggMoveLearnset", ""), set()),
+                "teachable": indexed_by_source["teachable"].get(record.values.get("teachableLearnset", ""), set()),
+            }
+            self.species_move_sources[record.key] = groups
+            result[record.key] = set().union(*groups.values())
+        return result
 
     def load_frontier_mons(self) -> None:
         path = self.window.root / "src/data/battle_frontier/battle_frontier_mons.h"
@@ -3183,6 +3846,7 @@ class BattleFrontierPanel(QWidget):
 
     def default_mon_values(self, record: SourceRecord) -> dict[str, str]:
         return {
+            "nickname": string_from_record(record, "nickname") if raw_field(record.block, "nickname") is not None else "",
             "species": first_token(record.values.get("species", ""), "SPECIES_", "SPECIES_NONE"),
             "moves": record.values.get("moves", "{MOVE_NONE, MOVE_NONE, MOVE_NONE, MOVE_NONE}"),
             "heldItem": first_token(record.values.get("heldItem", ""), "ITEM_", "ITEM_NONE"),
@@ -3199,7 +3863,8 @@ class BattleFrontierPanel(QWidget):
         self.capture_mon(); selected = self.mon_table.selectedItems()
         if not selected: return
         self.current_mon = selected[0].data(Qt.ItemDataRole.UserRole); values = self.mon_states.get(self.current_mon.key, self.default_mon_values(self.current_mon)); self.loading = True
-        for combo, key in ((self.mon_species, "species"), (self.mon_item, "heldItem"), (self.mon_ability, "ability"), (self.mon_nature, "nature"), (self.mon_ball, "ball"), (self.mon_gender, "gender"), (self.mon_tera, "teraType")): self.set_combo(combo, values[key])
+        self.mon_nickname.setText(values["nickname"]); self.set_combo(self.mon_species, values["species"]); self.refresh_ability_choices(values["ability"]); self.refresh_item_choices(values["heldItem"])
+        for combo, key in ((self.mon_item, "heldItem"), (self.mon_ability, "ability"), (self.mon_nature, "nature"), (self.mon_ball, "ball"), (self.mon_gender, "gender"), (self.mon_tera, "teraType")): self.set_combo(combo, values[key])
         self.refresh_move_choices(); moves = re.findall(r"\bMOVE_[A-Z0-9_]+\b", values["moves"]); moves = (moves + ["MOVE_NONE"] * 4)[:4]
         for combo, move in zip(self.mon_moves, moves): self.set_combo(combo, move)
         self.refresh_move_choices()
@@ -3212,22 +3877,34 @@ class BattleFrontierPanel(QWidget):
     def refresh_move_choices(self) -> None:
         if not hasattr(self, "mon_moves"): return
         species = self.combo_value(self.mon_species) or "SPECIES_NONE"; preferred = self.species_learnsets.get(species, set()); selected = [self.combo_value(combo) or "MOVE_NONE" for combo in self.mon_moves]
-        ordered = ["MOVE_NONE"] + sorted(preferred, key=lambda key: self.move_names.get(key, key))
+        sources = self.species_move_sources.get(species, {})
+        ordered = ["MOVE_NONE"]
+        for group in ("level", "egg", "teachable"):
+            for move in sorted(sources.get(group, set()), key=lambda key: self.move_names.get(key, key)):
+                if move not in ordered:
+                    ordered.append(move)
         for move in selected:
             if move and move not in ordered: ordered.append(move)
         for move in sorted(self.move_values, key=lambda key: self.move_names.get(key, key)):
             if move not in ordered: ordered.append(move)
         for combo, current in zip(self.mon_moves, selected):
             combo.blockSignals(True); combo.clear(); combo.setEditable(True)
-            for move in ordered: combo.addItem(f"{self.move_names.get(move, move)} [{move}]", move)
+            for move in ordered:
+                labels = []
+                if move in sources.get("level", set()): labels.append("Lv")
+                if move in sources.get("egg", set()): labels.append("Egg")
+                if move in sources.get("teachable", set()): labels.append("TM")
+                source_label = f" ({'/'.join(labels)})" if labels else ""
+                combo.addItem(f"{self.move_names.get(move, move)}{source_label} [{move}]", move)
             self.set_combo(combo, current); combo.blockSignals(False)
         off_list = [move for move in selected if move not in preferred and move != "MOVE_NONE"]
-        self.move_filter_label.setText(f"Learnset moves: {len(preferred)} / off-list: {', '.join(off_list) if off_list else 'none'}")
+        self.move_filter_label.setText(f"Lv {len(sources.get('level', set()))} / Egg {len(sources.get('egg', set()))} / TM {len(sources.get('teachable', set()))} / Total {len(preferred)} / off-list: {', '.join(off_list) if off_list else 'none'}")
 
     def values_for_mon(self, record: SourceRecord) -> dict[str, str]:
         ev_values = [box.value() for box in self.ev_boxes]; iv_values = [box.value() for box in self.iv_boxes]
         raw_ev = raw_field(record.block, "ev") is not None; raw_iv = raw_field(record.block, "iv") is not None
         return {
+            "nickname": self.mon_nickname.text().strip(),
             "species": self.combo_value(self.mon_species), "moves": "{" + ", ".join(self.combo_value(combo) or "MOVE_NONE" for combo in self.mon_moves) + "}",
             "heldItem": self.combo_value(self.mon_item) or "ITEM_NONE", "ev": f"TRAINER_PARTY_EVS({', '.join(str(value) for value in ev_values)})" if any(ev_values) or raw_ev else "",
             "iv": f"TRAINER_PARTY_IVS({', '.join(str(value) for value in iv_values)})" if any(iv_values) or raw_iv else "",
@@ -3243,10 +3920,10 @@ class BattleFrontierPanel(QWidget):
 
     def proposed_mon_block(self, record: SourceRecord) -> str:
         values = dict(self.mon_states.get(record.key, self.default_mon_values(record)))
-        missing_defaults = {"heldItem": "ITEM_NONE", "ev": "", "iv": "", "ability": "ABILITY_NONE", "lvl": "0", "ball": "BALL_POKE", "friendship": "0", "nature": "NATURE_HARDY", "gender": "0", "isShiny": "FALSE", "teraType": "TYPE_NONE", "gigantamaxFactor": "FALSE", "shouldUseDynamax": "FALSE", "dynamaxLevel": "0", "tags": "0"}
+        missing_defaults = {"nickname": "", "heldItem": "ITEM_NONE", "ev": "", "iv": "", "ability": "ABILITY_NONE", "lvl": "0", "ball": "BALL_POKE", "friendship": "0", "nature": "NATURE_HARDY", "gender": "0", "isShiny": "FALSE", "teraType": "TYPE_NONE", "gigantamaxFactor": "FALSE", "shouldUseDynamax": "FALSE", "dynamaxLevel": "0", "tags": "0"}
         for field, default in missing_defaults.items():
             if raw_field(record.block, field) is None and values.get(field) == default: values[field] = ""
-        return replace_record_fields(record, values, set())
+        return ensure_designated_initializer_commas(replace_record_fields(record, values, {"nickname"}))
 
     def mon_changed(self) -> None:
         if self.loading or not self.current_mon: return
@@ -3268,6 +3945,7 @@ class BattleFrontierPanel(QWidget):
                 source = self.contents[path]
                 if read_utf8(path) != source: raise RuntimeError(f"{rel(self.window.root, path)} changed on disk; reload before saving.")
                 for record in sorted(records, key=lambda item: item.start, reverse=True): source = source[:record.start] + self.proposed_mon_block(record) + source[record.end:]
+                assert_no_concatenated_designators(path, source, self.window.root)
                 write_with_backup(path, source)
         except (OSError, RuntimeError) as error:
             QMessageBox.critical(self, "Save failed", str(error)); return

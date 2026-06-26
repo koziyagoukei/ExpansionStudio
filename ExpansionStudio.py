@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import csv
 import difflib
+import json
+import os
 import re
 import shutil
 import sys
@@ -20,7 +22,7 @@ from typing import Callable, Iterable
 
 try:
     from PySide6.QtCore import QProcess, QProcessEnvironment, QSettings, QTimer, Qt, Signal
-    from PySide6.QtGui import QAction, QFont, QIcon, QImage, QPixmap, QTextCursor
+    from PySide6.QtGui import QAction, QFont, QIcon, QImage, QKeySequence, QPixmap, QShortcut, QTextCursor
     from PySide6.QtWidgets import (
         QAbstractItemView,
         QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
@@ -41,6 +43,9 @@ APP_NAME = "Pokemon Decomp Workbench"
 UI_FONT_POINT_SIZE = 11
 TABLE_VISIBLE_ROWS = 15
 TABLE_ROW_HEIGHT = 26
+COMBO_MIN_CONTENTS = 28
+DETAIL_PANEL_MIN_WIDTH = 520
+LIST_PANEL_MIN_WIDTH = 460
 DEFAULT_TERMINAL_COMMAND = 'powershell.exe -NoExit -Command "$env:PATH = \'{ROOT};\' + $env:PATH; Set-Location -LiteralPath \'{ROOT}\'"'
 DEFAULT_SCRIPT_RUN_TEMPLATE = 'powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "$env:PATH = \'{ROOT};\' + $env:PATH; Set-Location -LiteralPath \'{ROOT}\'; {SCRIPT}"'
 DEFAULT_TERMINAL_TYPE = "powershell"
@@ -94,7 +99,7 @@ LANG = {
     "en": {
         "window": "Pokemon Decomp Workbench", "root": "Repository", "browse": "Browse",
         "reload": "Reload", "save": "Save", "search": "Search", "clear": "Clear",
-        "translation": "Translation", "constants": "Constants", "files": "File Search",
+        "translation": "Translation", "constants": "Constants", "files": "File Search", "index": "Index",
         "species": "Pokemon", "moves": "Moves", "frontier": "Battle Frontier", "assets": "Assets",
         "dependencies": "Dependencies", "fonts": "Glyph Table", "poryscript": "Poryscript", "settings": "Settings",
         "language": "Language", "results": "results", "original": "Original", "edited": "Edited",
@@ -105,6 +110,7 @@ LANG = {
         "diff": "Diff", "terminal": "Open terminal", "command_settings": "Command settings",
     },
 }
+LANG["ja"]["index"] = "インデックス"
 
 
 def tr(key: str, lang: str) -> str:
@@ -184,6 +190,19 @@ def configure_table(table: QTableWidget, rows: int = TABLE_VISIBLE_ROWS) -> None
     fixed_height = 30 + (TABLE_ROW_HEIGHT * rows) + (table.frameWidth() * 2)
     table.setMinimumHeight(fixed_height)
     table.setMaximumHeight(fixed_height)
+
+
+def stabilize_combo(combo: QComboBox, min_contents: int = COMBO_MIN_CONTENTS) -> None:
+    """Prevent dynamic option lists from changing the surrounding layout width."""
+    combo.setMinimumContentsLength(min_contents)
+    combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+    combo.setMinimumWidth(260)
+
+
+def stabilize_splitter(splitter: QSplitter, first: int = 1, second: int = 1) -> None:
+    splitter.setChildrenCollapsible(False)
+    splitter.setStretchFactor(0, first)
+    splitter.setStretchFactor(1, second)
 
 
 def skip_space(text: str, pos: int) -> int:
@@ -284,6 +303,17 @@ def extract_c_text_symbol(source: str, symbol: str) -> str | None:
         return None
     parsed = parse_c_strings(source, match.end())
     return parsed[2] if parsed else None
+
+
+def extract_c_text_symbol_span(source: str, symbol: str) -> tuple[int, int, str] | None:
+    match = re.search(rf"\b{re.escape(symbol)}\s*(?:\[[^\]]*\])?\s*=\s*(?:_\s*\(|COMPOUND_STRING\s*\()", source)
+    if not match:
+        return None
+    parsed = parse_c_strings(source, match.end())
+    if not parsed:
+        return None
+    start, end, text = parsed
+    return start, end, text
 
 
 @dataclass
@@ -648,6 +678,26 @@ class TextEntry:
     @property
     def dirty(self) -> bool:
         return self.original != self.current
+
+
+@dataclass
+class TextVariableEntry:
+    placeholder: str
+    variant: str
+    symbol: str
+    description: str
+    path: Path | None
+    file_name: str
+    line: int
+    start: int
+    end: int
+    original: str
+    current: str
+    editable: bool
+
+    @property
+    def dirty(self) -> bool:
+        return self.editable and self.current != self.original
 
 
 def infer_symbol(text: str, macro_pos: int) -> str:
@@ -1404,8 +1454,266 @@ class EventBrowserPanel(QWidget):
         if self.current_id and (target := self.definitions.get(self.current_id)): DiffDialog(self, f"Diff: {target.symbol}", target.original, target.current).exec()
 
 
-class TranslationPanel(QWidget):
-    """Translation workspace with source strings and event-aware text browsing."""
+TEXT_VARIABLE_DEFS = [
+    ("KUN", "Male player", "gText_ExpandedPlaceholder_Kun", "Used when the saved player gender is male."),
+    ("KUN", "Female player", "gText_ExpandedPlaceholder_Chan", "Used when the saved player gender is not male."),
+    ("RIVAL", "Emerald / male player", "gText_ExpandedPlaceholder_May", "Fallback rival name for Emerald when the player is male."),
+    ("RIVAL", "Emerald / female player", "gText_ExpandedPlaceholder_Brendan", "Fallback rival name for Emerald when the player is female."),
+    ("RIVAL", "FRLG / male player", "gText_ExpandedPlaceholder_Green", "FRLG fallback rival name when no rival save name exists."),
+    ("RIVAL", "FRLG / female player", "gText_ExpandedPlaceholder_Red", "FRLG fallback rival name when no rival save name exists."),
+    ("VERSION", "Emerald", "gText_ExpandedPlaceholder_Emerald", "Version placeholder currently returned by ExpandPlaceholder_Version."),
+    ("AQUA", "Team Aqua", "gText_ExpandedPlaceholder_Aqua", "Fixed team name placeholder."),
+    ("MAGMA", "Team Magma", "gText_ExpandedPlaceholder_Magma", "Fixed team name placeholder."),
+    ("ARCHIE", "Archie", "gText_ExpandedPlaceholder_Archie", "Fixed character name placeholder."),
+    ("MAXIE", "Maxie", "gText_ExpandedPlaceholder_Maxie", "Fixed character name placeholder."),
+    ("KYOGRE", "Kyogre", "gText_ExpandedPlaceholder_Kyogre", "Fixed Pokemon name placeholder."),
+    ("GROUDON", "Groudon", "gText_ExpandedPlaceholder_Groudon", "Fixed Pokemon name placeholder."),
+    ("REGION", "Hoenn", "gText_Hoenn", "Returned by {REGION} in Emerald mode."),
+    ("REGION", "Kanto", "gText_Kanto", "Returned by {REGION} in FRLG mode."),
+]
+
+RUNTIME_PLACEHOLDER_DESCRIPTIONS = {
+    "PLAYER": "Runtime value: player name from save data.",
+    "STR_VAR_1": "Runtime value: gStringVar1.",
+    "STR_VAR_2": "Runtime value: gStringVar2.",
+    "STR_VAR_3": "Runtime value: gStringVar3.",
+    "B_BUFF1": "Battle runtime buffer.",
+    "B_BUFF2": "Battle runtime buffer.",
+    "B_BUFF3": "Battle runtime buffer.",
+    "B_CURRENT_MOVE": "Battle runtime value: current move name.",
+    "B_LAST_MOVE": "Battle runtime value: previous move name.",
+    "B_LAST_ITEM": "Battle runtime value: item name.",
+    "B_LAST_ABILITY": "Battle runtime value: ability name.",
+    "B_PLAYER_NAME": "Battle runtime value: player trainer name.",
+}
+
+CHARMAP_PLACEHOLDER_RE = re.compile(r"^\s*([A-Z][A-Z0-9_]+)\s*=\s*FD\b")
+
+
+def find_charmap_placeholders(root: Path) -> list[tuple[str, str, int]]:
+    path = root / "charmap.txt"
+    if not path.exists():
+        return []
+    result: list[tuple[str, str, int]] = []
+    try:
+        lines = read_utf8(path).splitlines()
+    except UnicodeDecodeError:
+        return []
+    for line_no, line in enumerate(lines, 1):
+        match = CHARMAP_PLACEHOLDER_RE.match(line)
+        if match:
+            result.append((match.group(1), line.strip(), line_no))
+    return result
+
+
+class TextVariablePanel(QWidget):
+    """Browse and edit text placeholders that expand into visible strings."""
+    def __init__(self, window: "Workbench", translation: TranslationTextPanel) -> None:
+        super().__init__()
+        self.window = window
+        self.translation = translation
+        self.entries: list[TextVariableEntry] = []
+        self.contents: dict[Path, str] = {}
+        self.current: TextVariableEntry | None = None
+        self.loading = False
+        self.search = QLineEdit()
+        self.changed = QCheckBox("Changed only")
+        self.count = QLabel()
+        self.table = QTableWidget(0, 7)
+        self.table.setHorizontalHeaderLabels(["*", "Variable", "Case", "Symbol", "Value", "File", "Line"])
+        self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.table.itemSelectionChanged.connect(self.select_entry)
+        self.detail = QLabel("Select a text variable.")
+        self.detail.setWordWrap(True)
+        self.original = QPlainTextEdit(); self.original.setReadOnly(True); self.original.setMaximumHeight(105)
+        self.editor = QPlainTextEdit(); self.editor.textChanged.connect(self.edit_changed)
+        self.usage = QListWidget()
+        self.char_count = QLabel("0")
+        self.build()
+
+    def build(self) -> None:
+        layout = QVBoxLayout(self)
+        filters = QHBoxLayout()
+        self.search.setPlaceholderText("Search variable / symbol / value")
+        self.search.textChanged.connect(self.refresh)
+        self.changed.stateChanged.connect(self.refresh)
+        filters.addWidget(self.search); filters.addWidget(self.changed); filters.addStretch(); filters.addWidget(self.count)
+        layout.addLayout(filters)
+        split = QSplitter(Qt.Orientation.Horizontal)
+        split.addWidget(self.table)
+        detail = QWidget(); detail_layout = QVBoxLayout(detail)
+        detail_layout.addWidget(self.detail)
+        detail_layout.addWidget(QLabel("Current expanded text"))
+        detail_layout.addWidget(self.original)
+        detail_layout.addWidget(QLabel("Edited text"))
+        detail_layout.addWidget(self.editor)
+        controls = QHBoxLayout()
+        self.revert_button = QPushButton("Revert"); self.revert_button.clicked.connect(self.revert)
+        self.diff_button = QPushButton("Diff"); self.diff_button.clicked.connect(self.show_diff)
+        self.save_button = QPushButton("Save"); self.save_button.clicked.connect(self.save)
+        controls.addWidget(self.revert_button); controls.addWidget(self.diff_button); controls.addStretch(); controls.addWidget(QLabel("Chars:")); controls.addWidget(self.char_count); controls.addWidget(self.save_button)
+        detail_layout.addLayout(controls)
+        detail_layout.addWidget(QLabel("Usage in scanned text entries"))
+        detail_layout.addWidget(self.usage)
+        split.addWidget(detail); split.setSizes([860, 620])
+        layout.addWidget(split)
+        self.retranslate()
+
+    def retranslate(self) -> None:
+        if self.window.lang == "ja":
+            self.changed.setText("変更済みのみ")
+            self.detail.setText("テキスト内変数を選択してください。")
+            self.revert_button.setText("元に戻す")
+            self.diff_button.setText("差分")
+            self.save_button.setText("保存")
+        else:
+            self.changed.setText("Changed only")
+            self.detail.setText("Select a text variable.")
+            self.revert_button.setText("Revert")
+            self.diff_button.setText("Diff")
+            self.save_button.setText("Save")
+
+    def load(self) -> None:
+        if not self.window.root_valid():
+            return
+        if not self.translation.entries:
+            self.translation.load()
+        self.entries = []
+        self.contents = {}
+        strings_path = self.window.root / "src/strings.c"
+        strings_source = read_utf8(strings_path) if strings_path.exists() else ""
+        if strings_source:
+            self.contents[strings_path] = strings_source
+        for placeholder, variant, symbol, description in TEXT_VARIABLE_DEFS:
+            found = extract_c_text_symbol_span(strings_source, symbol) if strings_source else None
+            if found:
+                start, end, value = found
+                line = strings_source.count("\n", 0, start) + 1
+                self.entries.append(TextVariableEntry(placeholder, variant, symbol, description, strings_path, rel(self.window.root, strings_path), line, start, end, value, value, True))
+            else:
+                self.entries.append(TextVariableEntry(placeholder, variant, symbol, description + " Source symbol was not found.", None, "(missing)", 0, 0, 0, "", "", False))
+        static_names = {placeholder for placeholder, _variant, _symbol, _description in TEXT_VARIABLE_DEFS}
+        for name, raw, line in find_charmap_placeholders(self.window.root):
+            if name in static_names:
+                continue
+            description = RUNTIME_PLACEHOLDER_DESCRIPTIONS.get(name, "Runtime value. Source text is decided by game code at display time.")
+            self.entries.append(TextVariableEntry(name, "runtime", raw, description, None, "charmap.txt", line, 0, 0, f"<{description}>", f"<{description}>", False))
+        self.current = None; self.original.clear(); self.editor.clear(); self.usage.clear(); self.refresh()
+        self.window.status(f"Scanned {len(self.entries)} text variables")
+
+    def filtered(self) -> list[TextVariableEntry]:
+        query = self.search.text().casefold().strip()
+        result: list[TextVariableEntry] = []
+        for entry in self.entries:
+            haystack = "\n".join((entry.placeholder, entry.variant, entry.symbol, entry.current, entry.description, entry.file_name)).casefold()
+            if query and query not in haystack:
+                continue
+            if self.changed.isChecked() and not entry.dirty:
+                continue
+            result.append(entry)
+        return result
+
+    def refresh(self) -> None:
+        visible = self.filtered()
+        selected = self.current
+        self.table.blockSignals(True)
+        self.table.setRowCount(len(visible))
+        for row, entry in enumerate(visible):
+            values = [
+                "*" if entry.dirty else "",
+                "{" + entry.placeholder + "}",
+                entry.variant,
+                entry.symbol,
+                entry.current.replace("\n", r"\n")[:160],
+                entry.file_name,
+                str(entry.line) if entry.line else "",
+            ]
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(value); item.setData(Qt.ItemDataRole.UserRole, entry); self.table.setItem(row, column, item)
+            if entry is selected:
+                self.table.selectRow(row)
+        self.table.blockSignals(False)
+        dirty = sum(entry.dirty for entry in self.entries)
+        self.count.setText(f"{len(visible)} / {len(self.entries)} results | Dirty: {dirty}")
+
+    def select_entry(self) -> None:
+        selected = self.table.selectedItems()
+        if not selected:
+            return
+        entry = selected[0].data(Qt.ItemDataRole.UserRole)
+        if entry is self.current:
+            return
+        self.current = entry
+        self.loading = True
+        editable = "editable" if entry.editable else "read-only"
+        self.detail.setText(f"{entry.placeholder} [{entry.variant}] - {editable}\n{entry.symbol}\n{entry.description}")
+        self.original.setPlainText(entry.original)
+        self.editor.setPlainText(entry.current if entry.editable else entry.original)
+        self.editor.setReadOnly(not entry.editable)
+        self.loading = False
+        self.char_count.setText(str(len(entry.current)))
+        self.refresh_usage(entry)
+
+    def refresh_usage(self, entry: TextVariableEntry) -> None:
+        self.usage.clear()
+        token = "{" + entry.placeholder + "}"
+        count = 0
+        for text_entry in self.translation.entries:
+            if token not in text_entry.current and token not in text_entry.original:
+                continue
+            preview = text_entry.current.replace("\n", r"\n")[:150]
+            item = QListWidgetItem(f"{text_entry.file_name}:{text_entry.line}  {text_entry.symbol}  {preview}")
+            item.setData(Qt.ItemDataRole.UserRole, text_entry)
+            self.usage.addItem(item)
+            count += 1
+        if count == 0:
+            self.usage.addItem("No scanned source text entry uses this placeholder.")
+
+    def edit_changed(self) -> None:
+        if self.loading or not self.current or not self.current.editable:
+            return
+        self.current.current = self.editor.toPlainText()
+        self.char_count.setText(str(len(self.current.current)))
+        self.refresh()
+
+    def revert(self) -> None:
+        if not self.current or not self.current.editable:
+            return
+        self.current.current = self.current.original
+        self.loading = True; self.editor.setPlainText(self.current.current); self.loading = False
+        self.refresh()
+
+    def save(self) -> None:
+        dirty = [entry for entry in self.entries if entry.dirty and entry.path is not None]
+        if not dirty:
+            return self.window.status("No text variable changes")
+        grouped: dict[Path, list[TextVariableEntry]] = {}
+        for entry in dirty:
+            grouped.setdefault(entry.path, []).append(entry)
+        try:
+            for path, entries in grouped.items():
+                disk = read_utf8(path)
+                if disk != self.contents.get(path, ""):
+                    raise RuntimeError(f"{rel(self.window.root, path)} changed on disk; reload first.")
+                updated = disk
+                for entry in sorted(entries, key=lambda item: item.start, reverse=True):
+                    updated = updated[:entry.start] + quote_c_text(entry.current) + updated[entry.end:]
+                write_with_backup(path, updated)
+        except (OSError, RuntimeError) as error:
+            QMessageBox.critical(self, "Variable save failed", str(error)); return
+        if self.translation.entries:
+            self.translation.load()
+        self.load()
+        self.window.status(f"Saved {len(dirty)} text variable value(s) with backups")
+
+    def show_diff(self) -> None:
+        if self.current:
+            DiffDialog(self, f"Diff: {self.current.placeholder} / {self.current.variant}", self.current.original, self.current.current).exec()
+
+
+class LegacyTranslationPanel(QWidget):
+    """Legacy translation panel kept for compatibility; TranslationPanel below is active."""
     def __init__(self, window: "Workbench") -> None:
         super().__init__(); self.window = window; self.loaded_sections: set[str] = set(); self.text = TranslationTextPanel(window); self.events = EventBrowserPanel(window, self.text); layout = QVBoxLayout(self); self.tabs = QTabWidget(); self.tabs.addTab(self.text, "文字列"); self.tabs.addTab(self.events, "イベントブラウザ"); self.tabs.currentChanged.connect(lambda _index: self.load_current()); layout.addWidget(self.tabs)
 
@@ -1437,6 +1745,69 @@ class TranslationPanel(QWidget):
 
     def show_diff(self) -> None:
         (self.events if self.tabs.currentWidget() is self.events else self.text).show_diff()
+
+
+class TranslationPanel(QWidget):
+    """Translation workspace with source strings, event text, and placeholders."""
+    def __init__(self, window: "Workbench") -> None:
+        super().__init__()
+        self.window = window
+        self.loaded_sections: set[str] = set()
+        self.text = TranslationTextPanel(window)
+        self.events = EventBrowserPanel(window, self.text)
+        self.variables = TextVariablePanel(window, self.text)
+        layout = QVBoxLayout(self)
+        self.tabs = QTabWidget()
+        self.tabs.addTab(self.text, "Strings")
+        self.tabs.addTab(self.events, "Event Browser")
+        self.tabs.addTab(self.variables, "Variables")
+        self.tabs.currentChanged.connect(lambda _index: self.load_current())
+        layout.addWidget(self.tabs)
+        self.retranslate()
+
+    def retranslate(self) -> None:
+        self.text.retranslate()
+        self.events.retranslate()
+        self.variables.retranslate()
+        self.tabs.setTabText(0, "文字列" if self.window.lang == "ja" else "Strings")
+        self.tabs.setTabText(1, "イベントブラウザ" if self.window.lang == "ja" else "Event Browser")
+        self.tabs.setTabText(2, "変数" if self.window.lang == "ja" else "Variables")
+
+    def reset_loaded(self) -> None:
+        self.loaded_sections.clear()
+
+    def load_current(self, force: bool = False) -> None:
+        current = self.tabs.currentWidget()
+        section = "events" if current is self.events else ("variables" if current is self.variables else "text")
+        if section in self.loaded_sections and not force:
+            return
+        self.window.begin_loading(f"読み込み中: {section}" if self.window.lang == "ja" else f"Loading: {section}")
+        try:
+            if section in {"events", "variables"} and ("text" not in self.loaded_sections or not self.text.entries or force):
+                self.text.load()
+                self.loaded_sections.add("text")
+            if section == "events":
+                self.events.load()
+            elif section == "variables":
+                self.variables.load()
+            else:
+                self.text.load()
+            self.loaded_sections.add(section)
+        finally:
+            self.window.end_loading()
+
+    def load(self) -> None:
+        self.load_current(force=True)
+
+    def save(self) -> None:
+        panel = self.tabs.currentWidget()
+        if hasattr(panel, "save"):
+            panel.save()
+
+    def show_diff(self) -> None:
+        panel = self.tabs.currentWidget()
+        if hasattr(panel, "show_diff"):
+            panel.show_diff()
 
 
 @dataclass
@@ -1712,6 +2083,355 @@ class FileSearchPanel(QWidget):
 
     def copy_result(self, item: QTreeWidgetItem) -> None:
         QApplication.clipboard().setText(f"{item.data(0, Qt.ItemDataRole.UserRole)}:{item.text(1)}")
+
+
+CODE_INDEX_VERSION = 1
+CODE_INDEX_DIRS = ("src", "include", "data", "asm", "constants")
+CODE_INDEX_SUFFIXES = {".c", ".h", ".inc", ".s", ".pory"}
+CODE_INDEX_EXCLUDE_DIRS = {".git", "build", "dist", "workspace", "_pyinstaller", "__pycache__", ".venv", "venv", "node_modules", ".expansionstudio"}
+CODE_INDEX_EXCLUDE_SUFFIXES = {".o", ".d", ".elf", ".gba", ".sav"}
+CODE_INDEX_KINDS = ("constant", "gText", "COMPOUND_STRING", "script", "macro", "enum", "struct")
+DEFINE_RE = re.compile(r"(?m)^[ \t]*#define[ \t]+([A-Za-z_][A-Za-z0-9_]*)(\([^)]*\))?[ \t]*(.*)$")
+ASM_CONST_RE = re.compile(r"(?m)^[ \t]*\.(?:set|equiv)[ \t]+([A-Za-z_][A-Za-z0-9_]*)[ \t]*,[ \t]*(.+)$")
+ASM_MACRO_RE = re.compile(r"(?m)^[ \t]*\.macro[ \t]+([A-Za-z_][A-Za-z0-9_]*)(.*)$")
+GTEXT_RE = re.compile(r"\b(gText_[A-Za-z0-9_]+)\s*(?:\[[^\]]*\])?\s*=\s*_\s*\(")
+COMPOUND_RE = re.compile(r"\b(COMPOUND_STRING)\s*\(")
+INC_LABEL_RE = re.compile(r"(?m)^([A-Za-z_][A-Za-z0-9_]*):(?::)?\s*(?:@.*)?$")
+PORY_BLOCK_RE = re.compile(r"(?m)^\s*(script|text|movement|mart|mapscripts|object|warp|coord|bg|callback)\s+([A-Za-z_][A-Za-z0-9_]*)\b")
+ENUM_RE = re.compile(r"\b(?:typedef\s+)?enum\b([^{;]*)\{")
+STRUCT_RE = re.compile(r"\b(?:typedef\s+)?struct\b([^{;]*)\{")
+TYPEDEF_STRUCT_TAIL_RE = re.compile(r"\}\s*([A-Za-z_][A-Za-z0-9_]*)\s*;")
+ENUM_MEMBER_RE = re.compile(r"^\s*([A-Z][A-Z0-9_]+)\s*(?:=\s*([^,/{]+))?\s*,?", re.M)
+CODE_IDENTIFIER_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+
+@dataclass
+class CodeIndexEntry:
+    kind: str
+    name: str
+    value_or_signature: str
+    file: str
+    line: int
+    preview: str
+    search_text: str
+
+
+def code_index_search_text(name: str, value: str, file_name: str, preview: str) -> str:
+    return " ".join((name, value, file_name, preview)).casefold()
+
+
+def make_code_index_entry(kind: str, name: str, value: str, file_name: str, line: int, preview: str) -> CodeIndexEntry:
+    clean_preview = " ".join(preview.strip().split())[:260]
+    return CodeIndexEntry(kind, name, value.strip(), file_name, line, clean_preview, code_index_search_text(name, value, file_name, clean_preview))
+
+
+def c_tag_name(head: str) -> str:
+    names = re.findall(r"\b[A-Za-z_][A-Za-z0-9_]*\b", head)
+    ignored = {"__attribute__", "packed", "aligned", "unused"}
+    useful = [name for name in names if name not in ignored]
+    return useful[-1] if useful else ""
+
+
+def code_index_cache_path(root: Path) -> Path:
+    return root / ".expansionstudio" / "index.json"
+
+
+def code_index_excluded(path: Path, root: Path) -> bool:
+    try:
+        relative = path.relative_to(root)
+    except ValueError:
+        return True
+    parts = set(relative.parts)
+    if parts.intersection(CODE_INDEX_EXCLUDE_DIRS):
+        return True
+    if any(part.startswith("rollback_") for part in relative.parts):
+        return True
+    name = path.name
+    if name.endswith(".bak") or ".bak." in name:
+        return True
+    if path.suffix.lower() in CODE_INDEX_EXCLUDE_SUFFIXES:
+        return True
+    return False
+
+
+def code_index_paths(root: Path) -> list[Path]:
+    paths: list[Path] = []
+    for dirname in CODE_INDEX_DIRS:
+        base = root / dirname
+        if not base.exists():
+            continue
+        for path in base.rglob("*"):
+            if not path.is_file() or path.suffix not in CODE_INDEX_SUFFIXES:
+                continue
+            if not code_index_excluded(path, root):
+                paths.append(path)
+    return sorted(paths, key=lambda item: item.as_posix().casefold())
+
+
+def append_enum_members(entries: list[CodeIndexEntry], root: Path, path: Path, source: str, body_start: int, body_end: int) -> None:
+    file_name = rel(root, path)
+    body = source[body_start:body_end]
+    for member in ENUM_MEMBER_RE.finditer(body):
+        name = member.group(1)
+        value = member.group(2) or ""
+        line = source.count("\n", 0, body_start + member.start()) + 1
+        entries.append(make_code_index_entry("constant", name, value, file_name, line, source.splitlines()[line - 1] if line else ""))
+
+
+def build_code_index(root: Path) -> list[CodeIndexEntry]:
+    entries: list[CodeIndexEntry] = []
+    for path in code_index_paths(root):
+        try:
+            source = read_utf8(path)
+        except UnicodeDecodeError:
+            continue
+        file_name = rel(root, path)
+        lines = source.splitlines()
+        for match in DEFINE_RE.finditer(source):
+            line = source.count("\n", 0, match.start()) + 1
+            name, args, value = match.group(1), match.group(2) or "", match.group(3).strip()
+            kind = "macro" if args else "constant"
+            entries.append(make_code_index_entry(kind, name, (args + " " + value).strip(), file_name, line, lines[line - 1] if line <= len(lines) else ""))
+        for match in ASM_CONST_RE.finditer(source):
+            line = source.count("\n", 0, match.start()) + 1
+            entries.append(make_code_index_entry("constant", match.group(1), match.group(2), file_name, line, lines[line - 1] if line <= len(lines) else ""))
+        for match in ASM_MACRO_RE.finditer(source):
+            line = source.count("\n", 0, match.start()) + 1
+            entries.append(make_code_index_entry("macro", match.group(1), match.group(2), file_name, line, lines[line - 1] if line <= len(lines) else ""))
+        for match in GTEXT_RE.finditer(source):
+            parsed = parse_c_strings(source, match.end())
+            value = parsed[2] if parsed else ""
+            line = source.count("\n", 0, match.start()) + 1
+            entries.append(make_code_index_entry("gText", match.group(1), value, file_name, line, lines[line - 1] if line <= len(lines) else ""))
+        for match in COMPOUND_RE.finditer(source):
+            parsed = parse_c_strings(source, match.end())
+            if not parsed:
+                continue
+            line = source.count("\n", 0, match.start()) + 1
+            symbol = infer_symbol(source, match.start())
+            entries.append(make_code_index_entry("COMPOUND_STRING", symbol, parsed[2], file_name, line, lines[line - 1] if line <= len(lines) else ""))
+        if path.suffix == ".inc":
+            for match in INC_LABEL_RE.finditer(source):
+                line = source.count("\n", 0, match.start()) + 1
+                entries.append(make_code_index_entry("script", match.group(1), "inc label", file_name, line, lines[line - 1] if line <= len(lines) else ""))
+        if path.suffix == ".pory":
+            for match in PORY_BLOCK_RE.finditer(source):
+                line = source.count("\n", 0, match.start()) + 1
+                entries.append(make_code_index_entry("script", match.group(2), match.group(1), file_name, line, lines[line - 1] if line <= len(lines) else ""))
+        for match in ENUM_RE.finditer(source):
+            open_pos = source.find("{", match.start())
+            end = balanced_end(source, open_pos)
+            if end is None:
+                continue
+            line = source.count("\n", 0, match.start()) + 1
+            name = c_tag_name(match.group(1)) or f"enum @ {file_name}:{line}"
+            entries.append(make_code_index_entry("enum", name, "", file_name, line, lines[line - 1] if line <= len(lines) else ""))
+            append_enum_members(entries, root, path, source, open_pos + 1, end - 1)
+        for match in STRUCT_RE.finditer(source):
+            open_pos = source.find("{", match.start())
+            end = balanced_end(source, open_pos)
+            if end is None:
+                continue
+            line = source.count("\n", 0, match.start()) + 1
+            tail = TYPEDEF_STRUCT_TAIL_RE.search(source, end - 1, min(len(source), end + 120))
+            name = c_tag_name(match.group(1)) or (tail.group(1) if tail else f"struct @ {file_name}:{line}")
+            entries.append(make_code_index_entry("struct", name, "", file_name, line, lines[line - 1] if line <= len(lines) else ""))
+    return entries
+
+
+def save_code_index_cache(root: Path, entries: list[CodeIndexEntry]) -> None:
+    path = code_index_cache_path(root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "version": CODE_INDEX_VERSION,
+        "root": str(root),
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "entries": [entry.__dict__ for entry in entries],
+    }
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def load_code_index_cache(root: Path) -> list[CodeIndexEntry] | None:
+    path = code_index_cache_path(root)
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(read_utf8(path))
+        if payload.get("version") != CODE_INDEX_VERSION:
+            return None
+        entries = payload.get("entries", [])
+        return [CodeIndexEntry(**entry) for entry in entries]
+    except (OSError, TypeError, ValueError):
+        return None
+
+
+class CodeIndexPanel(QWidget):
+    def __init__(self, window: "Workbench") -> None:
+        super().__init__(); self.window = window; self.entries: list[CodeIndexEntry] = []; self.name_index: dict[str, list[CodeIndexEntry]] = {}; self.current: CodeIndexEntry | None = None
+        layout = QVBoxLayout(self); bar = QHBoxLayout(); self.query = QLineEdit(); self.query.setPlaceholderText("Search definitions"); self.query.textChanged.connect(self.refresh); self.kind = QComboBox(); self.kind.addItem("All kinds", ""); [self.kind.addItem(kind, kind) for kind in CODE_INDEX_KINDS]; self.kind.currentIndexChanged.connect(self.refresh); self.path_filter = QLineEdit(); self.path_filter.setPlaceholderText("Filter path"); self.path_filter.textChanged.connect(self.refresh); self.reindex_button = QPushButton("Re-index"); self.reindex_button.clicked.connect(lambda: self.load(force=True)); bar.addWidget(self.query); bar.addWidget(self.kind); bar.addWidget(self.path_filter); bar.addWidget(self.reindex_button); layout.addLayout(bar)
+        split = QSplitter(Qt.Orientation.Horizontal); self.table = QTableWidget(0, 6); self.table.setHorizontalHeaderLabels(["Kind", "Name", "Value / Signature", "File", "Line", "Preview"]); self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows); self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers); self.table.itemSelectionChanged.connect(self.select_entry); self.table.itemDoubleClicked.connect(lambda _item: self.goto_definition()); split.addWidget(self.table)
+        detail = QWidget(); detail_layout = QVBoxLayout(detail); self.detail = QLabel("Select an index entry."); self.detail.setWordWrap(True); detail_layout.addWidget(self.detail); self.preview = QPlainTextEdit(); self.preview.setReadOnly(True); detail_layout.addWidget(self.preview); buttons = QHBoxLayout(); self.goto_button = QPushButton("Go to definition"); self.goto_button.clicked.connect(self.goto_definition); self.open_button = QPushButton("Open file"); self.open_button.clicked.connect(self.open_file); self.jump_button = QPushButton("Copy line jump"); self.jump_button.clicked.connect(self.copy_line_jump); self.copy_name_button = QPushButton("Copy name"); self.copy_name_button.clicked.connect(self.copy_name); self.copy_path_button = QPushButton("Copy path"); self.copy_path_button.clicked.connect(self.copy_path); self.refs_button = QPushButton("Reference search"); self.refs_button.clicked.connect(self.reference_search); [buttons.addWidget(button) for button in (self.goto_button, self.open_button, self.jump_button, self.copy_name_button, self.copy_path_button, self.refs_button)]; detail_layout.addLayout(buttons); split.addWidget(detail); split.setSizes([980, 520]); layout.addWidget(split); self.goto_shortcut = QShortcut(QKeySequence("F12"), self); self.goto_shortcut.activated.connect(self.goto_definition); self.reference_shortcut = QShortcut(QKeySequence("Ctrl+Shift+F"), self); self.reference_shortcut.activated.connect(self.reference_search)
+
+    def retranslate(self) -> None:
+        self.goto_button.setText("定義へジャンプ" if self.window.lang == "ja" else "Go to definition")
+        self.reindex_button.setText("再インデックス" if self.window.lang == "ja" else "Re-index")
+        self.open_button.setText("ファイルを開く" if self.window.lang == "ja" else "Open file")
+        self.jump_button.setText("行へジャンプ" if self.window.lang == "ja" else "Copy line jump")
+        self.copy_name_button.setText("名前をコピー" if self.window.lang == "ja" else "Copy name")
+        self.copy_path_button.setText("パスをコピー" if self.window.lang == "ja" else "Copy path")
+        self.refs_button.setText("参照検索" if self.window.lang == "ja" else "Reference search")
+
+    def load(self, force: bool = False) -> None:
+        if not self.window.root_valid():
+            return
+        self.window.begin_loading("インデックス作成中..." if self.window.lang == "ja" else "Building index...")
+        try:
+            cached = None if force else load_code_index_cache(self.window.root)
+            if cached is None:
+                self.entries = build_code_index(self.window.root)
+                save_code_index_cache(self.window.root, self.entries)
+                self.window.status(f"Indexed {len(self.entries)} definitions")
+            else:
+                self.entries = cached
+                self.window.status(f"Loaded {len(self.entries)} index entries")
+            self.current = None; self.preview.clear(); self.rebuild_name_index(); self.refresh()
+        finally:
+            self.window.end_loading()
+
+    def rebuild_name_index(self) -> None:
+        self.name_index.clear()
+        for entry in self.entries:
+            self.name_index.setdefault(entry.name, []).append(entry)
+
+    def selected_identifier(self) -> str:
+        cursor = self.preview.textCursor()
+        selected = cursor.selectedText().replace("\u2029", "\n").strip()
+        if CODE_IDENTIFIER_RE.fullmatch(selected):
+            return selected
+        text = self.preview.toPlainText()
+        pos = cursor.position()
+        for match in CODE_IDENTIFIER_RE.finditer(text):
+            if match.start() <= pos <= match.end():
+                return match.group(0)
+        return self.current.name if self.current else self.query.text().strip()
+
+    def definition_candidates(self, name: str) -> list[CodeIndexEntry]:
+        if not name:
+            return []
+        exact = self.name_index.get(name, [])
+        if exact:
+            return exact
+        folded = name.casefold()
+        return [entry for entry in self.entries if entry.name.casefold().startswith(folded)]
+
+    def choose_definition(self, name: str, candidates: list[CodeIndexEntry]) -> CodeIndexEntry | None:
+        if not candidates:
+            QMessageBox.information(self, "Definition not found", f"No definition candidate for: {name}")
+            return None
+        if len(candidates) == 1:
+            return candidates[0]
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f"Definition candidates: {name}")
+        dialog.resize(1000, 560)
+        layout = QVBoxLayout(dialog)
+        table = QTableWidget(len(candidates), 5)
+        table.setHorizontalHeaderLabels(["Kind", "Name", "File", "Line", "Preview"])
+        table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        for row, entry in enumerate(candidates):
+            for column, value in enumerate((entry.kind, entry.name, entry.file, str(entry.line), entry.preview)):
+                item = QTableWidgetItem(value)
+                item.setData(Qt.ItemDataRole.UserRole, entry)
+                table.setItem(row, column, item)
+        table.selectRow(0)
+        layout.addWidget(table)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        table.itemDoubleClicked.connect(lambda _item: dialog.accept())
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return None
+        selected = table.selectedItems()
+        return selected[0].data(Qt.ItemDataRole.UserRole) if selected else candidates[0]
+
+    def show_entry(self, target: CodeIndexEntry) -> None:
+        self.query.setText(target.name)
+        self.kind.setCurrentIndex(0)
+        self.path_filter.clear()
+        rows = self.filtered()
+        self.refresh()
+        for row, entry in enumerate(rows):
+            if entry.file == target.file and entry.line == target.line and entry.kind == target.kind and entry.name == target.name:
+                self.table.selectRow(row)
+                break
+        self.current = target
+        self.detail.setText(f"{target.kind} | {target.name}\n{target.file}:{target.line}")
+        self.preview.setPlainText(f"{target.preview}\n\n{target.value_or_signature}")
+        QApplication.clipboard().setText(f"{target.file}:{target.line}")
+        self.window.status(f"Definition: {target.name} -> {target.file}:{target.line}")
+
+    def goto_definition(self) -> None:
+        name = self.selected_identifier()
+        target = self.choose_definition(name, self.definition_candidates(name))
+        if target:
+            self.show_entry(target)
+
+    def filtered(self) -> list[CodeIndexEntry]:
+        query = self.query.text().casefold().strip(); kind = self.kind.currentData(); path_query = self.path_filter.text().casefold().strip()
+        result = []
+        for entry in self.entries:
+            if kind and entry.kind != kind: continue
+            if query and query not in entry.search_text: continue
+            if path_query and path_query not in entry.file.casefold(): continue
+            result.append(entry)
+        return result
+
+    def refresh(self) -> None:
+        rows = self.filtered(); self.table.setRowCount(len(rows))
+        for row, entry in enumerate(rows):
+            values = [entry.kind, entry.name, entry.value_or_signature[:160], entry.file, str(entry.line), entry.preview]
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(value); item.setData(Qt.ItemDataRole.UserRole, entry); self.table.setItem(row, column, item)
+        self.window.status(f"{len(rows)} / {len(self.entries)} index entries")
+
+    def select_entry(self) -> None:
+        selected = self.table.selectedItems()
+        if not selected: return
+        self.current = selected[0].data(Qt.ItemDataRole.UserRole)
+        entry = self.current
+        self.detail.setText(f"{entry.kind} | {entry.name}\n{entry.file}:{entry.line}")
+        self.preview.setPlainText(f"{entry.preview}\n\n{entry.value_or_signature}")
+
+    def current_location(self) -> str:
+        return f"{self.current.file}:{self.current.line}" if self.current else ""
+
+    def open_file(self) -> None:
+        if not self.current: return
+        path = self.window.root / self.current.file
+        QApplication.clipboard().setText(self.current_location())
+        if sys.platform.startswith("win"):
+            try: os.startfile(path)  # type: ignore[attr-defined]
+            except OSError: pass
+        self.window.status(f"Copied/opened {self.current_location()}")
+
+    def copy_line_jump(self) -> None:
+        if self.current:
+            QApplication.clipboard().setText(self.current_location()); self.window.status(self.current_location())
+
+    def copy_name(self) -> None:
+        if self.current:
+            QApplication.clipboard().setText(self.current.name); self.window.status(self.current.name)
+
+    def copy_path(self) -> None:
+        if self.current:
+            QApplication.clipboard().setText(self.current.file); self.window.status(self.current.file)
+
+    def reference_search(self) -> None:
+        if not self.current: return
+        self.window.files.query.setText(self.current.name)
+        self.window.tabs.setCurrentWidget(self.window.files)
+        self.window.files.search()
 
 
 @dataclass
@@ -2798,6 +3518,12 @@ CATEGORY_LABELS = {
     "DAMAGE_CATEGORY_SPECIAL": "特殊",
     "DAMAGE_CATEGORY_STATUS": "変化",
 }
+HIDDEN_POWER_TYPE_ORDER = [
+    "TYPE_FIGHTING", "TYPE_FLYING", "TYPE_POISON", "TYPE_GROUND",
+    "TYPE_ROCK", "TYPE_BUG", "TYPE_GHOST", "TYPE_STEEL",
+    "TYPE_FIRE", "TYPE_WATER", "TYPE_GRASS", "TYPE_ELECTRIC",
+    "TYPE_PSYCHIC", "TYPE_ICE", "TYPE_DRAGON", "TYPE_DARK",
+]
 EFFECT_LABELS = {
     "EFFECT_HIT": "通常ダメージ",
     "EFFECT_SLEEP": "ねむり状態にする",
@@ -2948,8 +3674,20 @@ def string_from_record(record: SourceRecord, name: str) -> str:
     return parsed[2] if parsed else record.values.get(name, "")
 
 
-def replace_record_fields(record: SourceRecord, values: dict[str, str], strings: set[str]) -> str:
+def set_record_string_macro(block: str, field_name: str, macro: str) -> str:
+    raw = raw_field(block, field_name)
+    if not raw:
+        return block
+    start, end, value = raw
+    match = re.search(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\(", value)
+    if not match:
+        return block
+    return block[:start + match.start(1)] + macro + block[start + match.end(1):]
+
+
+def replace_record_fields(record: SourceRecord, values: dict[str, str], strings: set[str], string_macros: dict[str, str] | None = None) -> str:
     """Apply supported field changes to one record without reformatting its source."""
+    string_macros = string_macros or {}
     replacements: list[tuple[int, int, str]] = []
     additions: list[str] = []
     for field_name, value in values.items():
@@ -2964,14 +3702,22 @@ def replace_record_fields(record: SourceRecord, values: dict[str, str], strings:
                 replacements.append((raw[0], raw[1], value))
         elif value not in {"", "FALSE", "0"}:
             if field_name in strings:
-                additions.append(f"        .{field_name} = _({quote_c_text(value)}),\n")
+                macro = string_macros.get(field_name, "_")
+                additions.append(f"        .{field_name} = {macro}({quote_c_text(value)}),\n")
             else:
                 additions.append(f"        .{field_name} = {value},\n")
     updated = record.block
     for start, end, value in sorted(replacements, reverse=True):
         updated = updated[:start] + value + updated[end:]
+    for field_name, macro in string_macros.items():
+        if field_name in strings and raw_field(updated, field_name):
+            updated = set_record_string_macro(updated, field_name, macro)
     if additions:
+        updated = ensure_designated_initializer_commas(updated)
         insert_at = updated.rfind("}")
+        line_start = updated.rfind("\n", 0, insert_at) + 1
+        if line_start > 0:
+            insert_at = line_start
         updated = updated[:insert_at] + "".join(additions) + updated[insert_at:]
     return updated
 
@@ -3512,6 +4258,24 @@ class FactoryIvRecord:
     newline: str
 
 
+@dataclass
+class GeneralTrainerBlock:
+    path: Path
+    key: str
+    start: int
+    end: int
+    raw: str
+    name: str
+    trainer_class: str
+    party_count: int
+
+
+@dataclass
+class MoveMetadata:
+    type: str
+    category: str
+
+
 class BattleFrontierPanel(QWidget):
     """Battle Frontier and Battle Factory source editor."""
     def __init__(self, window: "Workbench") -> None:
@@ -3519,8 +4283,9 @@ class BattleFrontierPanel(QWidget):
         self.records: list[SourceRecord] = []; self.contents: dict[Path, str] = {}; self.mon_states: dict[str, dict[str, str]] = {}; self.current_mon: SourceRecord | None = None
         self.trainer_records: list[SourceRecord] = []; self.trainer_contents: dict[Path, str] = {}; self.current_trainer: SourceRecord | None = None
         self.macros: list[FrontierMacro] = []; self.current_macro: FrontierMacro | None = None; self.macro_original = ""
+        self.general_trainer_path = Path(); self.general_trainer_source = ""; self.general_trainers: list[GeneralTrainerBlock] = []; self.general_trainer_states: dict[str, str] = {}; self.current_general_trainer: GeneralTrainerBlock | None = None
         self.factory_path = Path(); self.factory_source = ""; self.factory_ranges: list[FactoryRangeRecord] = []; self.factory_ivs: list[FactoryIvRecord] = []; self.range_states: dict[int, tuple[str, str]] = {}; self.iv_states: dict[int, tuple[int, int]] = {}
-        self.species_names: dict[str, str] = {}; self.move_names: dict[str, str] = {}; self.item_names: dict[str, str] = {}; self.ability_names: dict[str, str] = {}
+        self.species_names: dict[str, str] = {}; self.move_names: dict[str, str] = {}; self.move_metadata: dict[str, MoveMetadata] = {}; self.item_names: dict[str, str] = {}; self.ability_names: dict[str, str] = {}
         self.species_abilities: dict[str, list[str]] = {}; self.item_pockets: dict[str, str] = {}; self.item_hold_effects: dict[str, str] = {}
         self.species_values: dict[str, int] = {}; self.move_values: dict[str, int] = {}; self.item_values: dict[str, int] = {}; self.frontier_values: dict[str, int] = {}; self.frontier_by_value: dict[int, str] = {}
         self.species_learnsets: dict[str, set[str]] = {}; self.species_move_sources: dict[str, dict[str, set[str]]] = {}; self.mon_usage_counts: dict[str, int] = {}; self.factory_usage: set[str] = set()
@@ -3528,14 +4293,21 @@ class BattleFrontierPanel(QWidget):
 
     def build(self) -> None:
         layout = QVBoxLayout(self); self.tabs = QTabWidget(); layout.addWidget(self.tabs)
-        self.build_mons_tab(); self.build_trainers_tab(); self.build_factory_tab()
+        self.build_mons_tab(); self.build_trainers_tab(); self.build_general_trainers_tab(); self.build_factory_tab()
+
+    @staticmethod
+    def set_columns(table: QTableWidget, widths: list[int]) -> None:
+        for column, width in enumerate(widths):
+            table.setColumnWidth(column, width)
 
     def build_mons_tab(self) -> None:
         page = QWidget(); layout = QVBoxLayout(page); split = QSplitter(Qt.Orientation.Horizontal)
         left = QWidget(); left_layout = QVBoxLayout(left); top = QHBoxLayout(); self.mon_search = QLineEdit(); self.mon_search.setPlaceholderText("FRONTIER_MON / species / item"); self.mon_search.textChanged.connect(self.refresh_mons); top.addWidget(self.mon_search)
+        left.setMinimumWidth(LIST_PANEL_MIN_WIDTH)
         self.mon_unused_only = QCheckBox("usage 0"); self.mon_unused_only.stateChanged.connect(self.refresh_mons); top.addWidget(self.mon_unused_only); left_layout.addLayout(top)
-        self.mon_table = QTableWidget(0, 6); self.mon_table.setHorizontalHeaderLabels(["No.", "Frontier ID", "Species", "Item", "Use", "Factory"]); self.mon_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows); self.mon_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers); self.mon_table.itemSelectionChanged.connect(self.select_mon); left_layout.addWidget(self.mon_table); split.addWidget(left)
-        right = QWidget(); right_layout = QVBoxLayout(right); self.mon_summary = QLabel(); self.mon_summary.setStyleSheet("font-size: 18px; font-weight: 700;"); right_layout.addWidget(self.mon_summary)
+        self.mon_table = QTableWidget(0, 12); self.mon_table.setHorizontalHeaderLabels(["No.", "Frontier ID", "Species", "Item", "Use", "Factory", "Mega", "Z", "DMax", "Tera", "Shiny", "Unused"]); self.mon_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows); self.mon_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers); self.mon_table.itemSelectionChanged.connect(self.select_mon); left_layout.addWidget(self.mon_table); split.addWidget(left)
+        self.set_columns(self.mon_table, [62, 210, 170, 150, 58, 70, 54, 44, 58, 58, 58, 68])
+        right = QWidget(); right.setMinimumWidth(DETAIL_PANEL_MIN_WIDTH); right_layout = QVBoxLayout(right); self.mon_summary = QLabel(); self.mon_summary.setStyleSheet("font-size: 18px; font-weight: 700;"); self.mon_summary.setMinimumHeight(34); right_layout.addWidget(self.mon_summary)
         form_tabs = QTabWidget(); basic = QWidget(); form = QFormLayout(basic)
         self.mon_species = self.combo(); self.mon_nickname = QLineEdit(); self.mon_item_category = QComboBox(); self.mon_item_filter = QLineEdit(); self.mon_item = self.combo(); self.mon_ability = self.combo(); self.mon_nature = self.combo(); self.mon_ball = self.combo(); self.mon_gender = self.combo(); self.mon_level = self.spin(0, 100); self.mon_friendship = self.spin(0, 255)
         self.mon_nickname.setPlaceholderText("空欄なら種族名"); self.mon_item_filter.setPlaceholderText("アイテム名 / ITEM_ / 効果で検索")
@@ -3543,18 +4315,31 @@ class BattleFrontierPanel(QWidget):
             self.mon_item_category.addItem(label, value)
         for label, control in (("Species", self.mon_species), ("Nickname", self.mon_nickname), ("Item group", self.mon_item_category), ("Item search", self.mon_item_filter), ("Held item", self.mon_item), ("Ability", self.mon_ability), ("Nature", self.mon_nature), ("Ball", self.mon_ball), ("Gender", self.mon_gender), ("Level override", self.mon_level), ("Friendship", self.mon_friendship)): form.addRow(label, control)
         form_tabs.addTab(basic, "Basic")
-        moves = QWidget(); moves_layout = QVBoxLayout(moves); self.move_filter_label = QLabel(); moves_layout.addWidget(self.move_filter_label); self.mon_moves = [self.combo() for _ in range(4)]
+        moves = QWidget(); moves_layout = QVBoxLayout(moves)
+        move_filters = QHBoxLayout(); self.move_category_filter = QComboBox(); self.move_type_filter = QComboBox()
+        self.move_category_filter.addItem("分類: すべて", "")
+        for key, label in CATEGORY_LABELS.items():
+            self.move_category_filter.addItem(f"分類: {label}", key)
+        self.move_type_filter.addItem("タイプ: すべて", "")
+        for key, label in TYPE_LABELS.items():
+            if key != "TYPE_NONE":
+                self.move_type_filter.addItem(f"タイプ: {label}", key)
+        stabilize_combo(self.move_category_filter, 16); stabilize_combo(self.move_type_filter, 16)
+        self.move_category_filter.currentIndexChanged.connect(self.refresh_move_choices); self.move_type_filter.currentIndexChanged.connect(self.refresh_move_choices)
+        move_filters.addWidget(self.move_category_filter); move_filters.addWidget(self.move_type_filter); move_filters.addStretch(); moves_layout.addLayout(move_filters)
+        self.move_filter_label = QLabel(); moves_layout.addWidget(self.move_filter_label); self.mon_moves = [self.combo() for _ in range(4)]
         for index, combo in enumerate(self.mon_moves, 1):
             row = QHBoxLayout(); row.addWidget(QLabel(f"Move {index}")); row.addWidget(combo); jump = QPushButton("Open"); jump.clicked.connect(lambda _checked=False, slot=index - 1: self.open_selected_move(slot)); row.addWidget(jump); moves_layout.addLayout(row)
         form_tabs.addTab(moves, "Moves")
         evs = QWidget(); ev_form = QFormLayout(evs); self.ev_boxes = [self.spin(0, 252) for _ in range(6)]; self.iv_boxes = [self.spin(0, 31) for _ in range(6)]
         for label, ev, iv in zip(("HP", "Atk", "Def", "Spe", "SpAtk", "SpDef"), self.ev_boxes, self.iv_boxes):
             row = QHBoxLayout(); row.addWidget(QLabel("EV")); row.addWidget(ev); row.addWidget(QLabel("IV")); row.addWidget(iv); ev_form.addRow(label, row)
+        self.hidden_power_label = QLabel(); self.hidden_power_label.setWordWrap(True); ev_form.addRow("Hidden Power", self.hidden_power_label)
         form_tabs.addTab(evs, "EV / IV")
         gimmick = QWidget(); gimmick_form = QFormLayout(gimmick); self.mon_tera = self.combo(); self.mon_dmax = QCheckBox("Use Dynamax"); self.mon_dmax_level = self.spin(0, 10); self.mon_gmax = QCheckBox("Gigantamax factor"); self.mon_shiny = QCheckBox("Shiny"); self.mon_tags = QLineEdit()
         for label, control in (("Tera type", self.mon_tera), ("Dynamax", self.mon_dmax), ("Dynamax level", self.mon_dmax_level), ("Gigantamax", self.mon_gmax), ("Shiny", self.mon_shiny), ("Tags", self.mon_tags)): gimmick_form.addRow(label, control)
         form_tabs.addTab(gimmick, "Gimmick")
-        right_layout.addWidget(form_tabs); buttons = QHBoxLayout(); diff = QPushButton("Diff"); diff.clicked.connect(self.show_mon_diff); save = QPushButton("Save pool"); save.clicked.connect(self.save_mons); buttons.addStretch(); buttons.addWidget(diff); buttons.addWidget(save); right_layout.addLayout(buttons); split.addWidget(right); split.setSizes([720, 760]); layout.addWidget(split); self.tabs.addTab(page, "Pokemon pool")
+        right_layout.addWidget(form_tabs); buttons = QHBoxLayout(); diff = QPushButton("Diff"); diff.clicked.connect(self.show_mon_diff); save = QPushButton("Save pool"); save.clicked.connect(self.save_mons); buttons.addStretch(); buttons.addWidget(diff); buttons.addWidget(save); right_layout.addLayout(buttons); split.addWidget(right); stabilize_splitter(split, 1, 1); split.setSizes([720, 760]); layout.addWidget(split); self.tabs.addTab(page, "Pokemon pool")
         self.mon_species.currentIndexChanged.connect(self.refresh_species_dependent_choices)
         self.mon_item_filter.textChanged.connect(self.refresh_item_choices); self.mon_item_category.currentIndexChanged.connect(self.refresh_item_choices)
         for control in [self.mon_species, self.mon_nickname, self.mon_item, self.mon_ability, self.mon_nature, self.mon_ball, self.mon_gender, self.mon_level, self.mon_friendship, self.mon_tera, self.mon_dmax, self.mon_dmax_level, self.mon_gmax, self.mon_shiny, self.mon_tags, *self.mon_moves, *self.ev_boxes, *self.iv_boxes]:
@@ -3562,23 +4347,38 @@ class BattleFrontierPanel(QWidget):
 
     def build_trainers_tab(self) -> None:
         page = QWidget(); layout = QVBoxLayout(page); split = QSplitter(Qt.Orientation.Horizontal)
-        left = QWidget(); left_layout = QVBoxLayout(left); self.trainer_search = QLineEdit(); self.trainer_search.setPlaceholderText("trainer / monSet"); self.trainer_search.textChanged.connect(self.refresh_trainers); left_layout.addWidget(self.trainer_search)
+        left = QWidget(); left.setMinimumWidth(LIST_PANEL_MIN_WIDTH); left_layout = QVBoxLayout(left); self.trainer_search = QLineEdit(); self.trainer_search.setPlaceholderText("trainer / monSet"); self.trainer_search.textChanged.connect(self.refresh_trainers); left_layout.addWidget(self.trainer_search)
         self.trainer_table = QTableWidget(0, 4); self.trainer_table.setHorizontalHeaderLabels(["Trainer", "Name", "Class", "monSet"]); self.trainer_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows); self.trainer_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers); self.trainer_table.itemSelectionChanged.connect(self.select_trainer); left_layout.addWidget(self.trainer_table); split.addWidget(left)
-        right = QWidget(); right_layout = QVBoxLayout(right); trainer_box = QGroupBox("Trainer monSet"); trainer_form = QFormLayout(trainer_box); self.trainer_name = QLabel(); self.trainer_monset = self.combo(); self.trainer_monset.setEditable(True); trainer_form.addRow("Name", self.trainer_name); trainer_form.addRow("monSet inner", self.trainer_monset); trainer_buttons = QHBoxLayout(); trainer_diff = QPushButton("Trainer diff"); trainer_diff.clicked.connect(self.show_trainer_diff); trainer_save = QPushButton("Save trainer"); trainer_save.clicked.connect(self.save_trainer); trainer_buttons.addStretch(); trainer_buttons.addWidget(trainer_diff); trainer_buttons.addWidget(trainer_save); trainer_form.addRow(trainer_buttons); right_layout.addWidget(trainer_box)
-        macro_box = QGroupBox("Pool macro body"); macro_layout = QVBoxLayout(macro_box); self.macro_select = QComboBox(); self.macro_select.currentIndexChanged.connect(self.select_macro); macro_layout.addWidget(self.macro_select); self.macro_editor = QPlainTextEdit(); self.macro_editor.textChanged.connect(self.macro_changed); macro_layout.addWidget(self.macro_editor); self.macro_mons = QTableWidget(0, 3); self.macro_mons.setHorizontalHeaderLabels(["Frontier ID", "Species", "Item"]); self.macro_mons.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows); self.macro_mons.itemDoubleClicked.connect(self.open_macro_mon); macro_layout.addWidget(self.macro_mons); macro_buttons = QHBoxLayout(); macro_diff = QPushButton("Macro diff"); macro_diff.clicked.connect(self.show_macro_diff); macro_save = QPushButton("Save macro"); macro_save.clicked.connect(self.save_macro); macro_buttons.addStretch(); macro_buttons.addWidget(macro_diff); macro_buttons.addWidget(macro_save); macro_layout.addLayout(macro_buttons); right_layout.addWidget(macro_box); split.addWidget(right); split.setSizes([720, 760]); layout.addWidget(split); self.tabs.addTab(page, "Trainer pools")
+        self.set_columns(self.trainer_table, [190, 150, 170, 210])
+        right = QWidget(); right.setMinimumWidth(DETAIL_PANEL_MIN_WIDTH); right_layout = QVBoxLayout(right); trainer_box = QGroupBox("Trainer monSet"); trainer_form = QFormLayout(trainer_box); self.trainer_name = QLabel(); self.trainer_monset = self.combo(); self.trainer_monset.setEditable(True); trainer_form.addRow("Name", self.trainer_name); trainer_form.addRow("monSet inner", self.trainer_monset); trainer_buttons = QHBoxLayout(); trainer_diff = QPushButton("Trainer diff"); trainer_diff.clicked.connect(self.show_trainer_diff); trainer_save = QPushButton("Save trainer"); trainer_save.clicked.connect(self.save_trainer); trainer_buttons.addStretch(); trainer_buttons.addWidget(trainer_diff); trainer_buttons.addWidget(trainer_save); trainer_form.addRow(trainer_buttons); right_layout.addWidget(trainer_box)
+        macro_box = QGroupBox("Pool macro body"); macro_layout = QVBoxLayout(macro_box); self.macro_select = QComboBox(); stabilize_combo(self.macro_select); self.macro_select.currentIndexChanged.connect(self.select_macro); macro_layout.addWidget(self.macro_select); self.macro_editor = QPlainTextEdit(); self.macro_editor.textChanged.connect(self.macro_changed); macro_layout.addWidget(self.macro_editor); self.macro_mons = QTableWidget(0, 3); self.macro_mons.setHorizontalHeaderLabels(["Frontier ID", "Species", "Item"]); self.macro_mons.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows); self.macro_mons.itemDoubleClicked.connect(self.open_macro_mon); self.set_columns(self.macro_mons, [230, 180, 170]); macro_layout.addWidget(self.macro_mons); macro_buttons = QHBoxLayout(); macro_diff = QPushButton("Macro diff"); macro_diff.clicked.connect(self.show_macro_diff); macro_save = QPushButton("Save macro"); macro_save.clicked.connect(self.save_macro); macro_buttons.addStretch(); macro_buttons.addWidget(macro_diff); macro_buttons.addWidget(macro_save); macro_layout.addLayout(macro_buttons); right_layout.addWidget(macro_box); split.addWidget(right); stabilize_splitter(split, 1, 1); split.setSizes([720, 760]); layout.addWidget(split); self.tabs.addTab(page, "Trainer pools")
+
+    def build_general_trainers_tab(self) -> None:
+        page = QWidget(); layout = QVBoxLayout(page); split = QSplitter(Qt.Orientation.Horizontal)
+        left = QWidget(); left.setMinimumWidth(LIST_PANEL_MIN_WIDTH); left_layout = QVBoxLayout(left)
+        self.general_trainer_search = QLineEdit(); self.general_trainer_search.setPlaceholderText("TRAINER_ / name / class / Pokemon"); self.general_trainer_search.textChanged.connect(self.refresh_general_trainers); left_layout.addWidget(self.general_trainer_search)
+        self.general_trainer_table = QTableWidget(0, 5); self.general_trainer_table.setHorizontalHeaderLabels(["Trainer", "Name", "Class", "Pokemon", "Flags"]); self.general_trainer_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows); self.general_trainer_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers); self.general_trainer_table.itemSelectionChanged.connect(self.select_general_trainer); left_layout.addWidget(self.general_trainer_table); split.addWidget(left)
+        self.set_columns(self.general_trainer_table, [240, 150, 170, 80, 170])
+        right = QWidget(); right.setMinimumWidth(DETAIL_PANEL_MIN_WIDTH); right_layout = QVBoxLayout(right)
+        self.general_trainer_label = QLabel("Select a trainer.party block."); self.general_trainer_label.setWordWrap(True); right_layout.addWidget(self.general_trainer_label)
+        self.general_trainer_editor = QPlainTextEdit(); self.general_trainer_editor.textChanged.connect(self.general_trainer_changed); right_layout.addWidget(self.general_trainer_editor)
+        buttons = QHBoxLayout(); diff = QPushButton("Trainer.party diff"); diff.clicked.connect(self.show_general_trainer_diff); save = QPushButton("Save trainer.party block"); save.clicked.connect(self.save_general_trainer); buttons.addStretch(); buttons.addWidget(diff); buttons.addWidget(save); right_layout.addLayout(buttons)
+        split.addWidget(right); stabilize_splitter(split, 1, 1); split.setSizes([720, 760]); layout.addWidget(split); self.tabs.addTab(page, "General trainers")
 
     def build_factory_tab(self) -> None:
         page = QWidget(); layout = QVBoxLayout(page); split = QSplitter(Qt.Orientation.Horizontal)
-        left = QWidget(); left_layout = QVBoxLayout(left); self.range_table = QTableWidget(0, 6); self.range_table.setHorizontalHeaderLabels(["Mode", "Challenge", "Start", "End", "Count", "Comment"]); self.range_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows); self.range_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers); self.range_table.itemSelectionChanged.connect(self.select_range); left_layout.addWidget(self.range_table)
+        left = QWidget(); left.setMinimumWidth(LIST_PANEL_MIN_WIDTH); left_layout = QVBoxLayout(left); self.range_table = QTableWidget(0, 6); self.range_table.setHorizontalHeaderLabels(["Mode", "Challenge", "Start", "End", "Count", "Comment"]); self.range_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows); self.range_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers); self.range_table.itemSelectionChanged.connect(self.select_range); left_layout.addWidget(self.range_table)
+        self.set_columns(self.range_table, [120, 90, 190, 190, 80, 160])
         self.iv_table = QTableWidget(0, 3); self.iv_table.setHorizontalHeaderLabels(["Challenge", "Low", "High"]); self.iv_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows); self.iv_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers); self.iv_table.itemSelectionChanged.connect(self.select_iv); left_layout.addWidget(self.iv_table); split.addWidget(left)
-        right = QWidget(); right_layout = QVBoxLayout(right); range_box = QGroupBox("Factory rental range"); range_form = QFormLayout(range_box); self.range_start = self.combo(); self.range_start.setEditable(True); self.range_end = self.combo(); self.range_end.setEditable(True); self.range_status = QLabel(); range_form.addRow("Start", self.range_start); range_form.addRow("End", self.range_end); range_form.addRow("Status", self.range_status); right_layout.addWidget(range_box)
+        self.set_columns(self.iv_table, [120, 90, 90])
+        right = QWidget(); right.setMinimumWidth(DETAIL_PANEL_MIN_WIDTH); right_layout = QVBoxLayout(right); range_box = QGroupBox("Factory rental range"); range_form = QFormLayout(range_box); self.range_start = self.combo(); self.range_start.setEditable(True); self.range_end = self.combo(); self.range_end.setEditable(True); self.range_status = QLabel(); range_form.addRow("Start", self.range_start); range_form.addRow("End", self.range_end); range_form.addRow("Status", self.range_status); right_layout.addWidget(range_box)
         iv_box = QGroupBox("Factory fixed IV table"); iv_form = QFormLayout(iv_box); self.iv_low = self.spin(0, 31); self.iv_high = self.spin(0, 31); iv_form.addRow("Low", self.iv_low); iv_form.addRow("High", self.iv_high); right_layout.addWidget(iv_box)
-        buttons = QHBoxLayout(); diff = QPushButton("Factory diff"); diff.clicked.connect(self.show_factory_diff); save = QPushButton("Save Factory"); save.clicked.connect(self.save_factory); buttons.addStretch(); buttons.addWidget(diff); buttons.addWidget(save); right_layout.addLayout(buttons); right_layout.addStretch(); split.addWidget(right); split.setSizes([760, 520]); layout.addWidget(split); self.tabs.addTab(page, "Battle Factory")
+        buttons = QHBoxLayout(); diff = QPushButton("Factory diff"); diff.clicked.connect(self.show_factory_diff); save = QPushButton("Save Factory"); save.clicked.connect(self.save_factory); buttons.addStretch(); buttons.addWidget(diff); buttons.addWidget(save); right_layout.addLayout(buttons); right_layout.addStretch(); split.addWidget(right); stabilize_splitter(split, 1, 1); split.setSizes([760, 520]); layout.addWidget(split); self.tabs.addTab(page, "Battle Factory")
         for control in [self.range_start, self.range_end, self.iv_low, self.iv_high]: self.watch(control, self.factory_changed)
 
     @staticmethod
     def combo() -> QComboBox:
-        combo = QComboBox(); combo.setMinimumWidth(260); return combo
+        combo = QComboBox(); stabilize_combo(combo); return combo
 
     @staticmethod
     def spin(low: int, high: int) -> QSpinBox:
@@ -3610,18 +4410,19 @@ class BattleFrontierPanel(QWidget):
 
     def load(self) -> None:
         if not self.window.root_valid(): return
-        self.load_reference_data(); self.load_frontier_mons(); self.load_macros(); self.load_trainers(); self.load_factory()
-        self.refresh_mons(); self.refresh_trainers(); self.refresh_macro_select(); self.refresh_factory()
+        self.load_reference_data(); self.load_frontier_mons(); self.load_macros(); self.load_trainers(); self.load_general_trainers(); self.load_factory()
+        self.refresh_mons(); self.refresh_trainers(); self.refresh_macro_select(); self.refresh_general_trainers(); self.refresh_factory()
 
     def load_reference_data(self) -> None:
         root = self.window.root
         species_paths = list((root / "src/data/pokemon/species_info").glob("*_families.h")) + [root / "src/data/pokemon/species_info.h"]
         species_records, _ = indexed_records(root, [path for path in species_paths if path.exists()], "SPECIES_", ["speciesName", "abilities", "levelUpLearnset", "eggMoveLearnset", "teachableLearnset"])
-        move_records, _ = indexed_records(root, [root / "src/data/moves_info.h"], "MOVE_", ["name"])
+        move_records, _ = indexed_records(root, [root / "src/data/moves_info.h"], "MOVE_", ["name", "type", "category"])
         item_records, _ = indexed_records(root, [root / "src/data/items.h"], "ITEM_", ["name", "pocket", "holdEffect"])
         ability_records, _ = indexed_records(root, [root / "src/data/abilities.h"], "ABILITY_", ["name"])
         self.species_values = enum_values(root / "include/constants/species.h", "SPECIES_"); self.move_values = enum_values(root / "include/constants/moves.h", "MOVE_"); self.item_values = enum_values(root / "include/constants/items.h", "ITEM_")
         self.species_names = {record.key: string_from_record(record, "speciesName") for record in species_records}; self.move_names = {record.key: string_from_record(record, "name") for record in move_records}; self.item_names = {record.key: string_from_record(record, "name") or record.key for record in item_records}; self.ability_names = {record.key: string_from_record(record, "name") for record in ability_records}
+        self.move_metadata = {record.key: MoveMetadata(first_token(record.values.get("type", ""), "TYPE_", "TYPE_NONE"), first_token(record.values.get("category", ""), "DAMAGE_CATEGORY_", "")) for record in move_records}
         self.species_abilities = {record.key: unique_tokens(re.findall(r"\bABILITY_[A-Z0-9_]+\b", record.values.get("abilities", "")), keep_none=False) or ["ABILITY_NONE"] for record in species_records}
         self.item_pockets = {record.key: record.values.get("pocket", "") for record in item_records}; self.item_hold_effects = {record.key: record.values.get("holdEffect", "HOLD_EFFECT_NONE") for record in item_records}
         self.frontier_values = define_values(root / "include/constants/battle_frontier_mons.h", ("FRONTIER_MON_", "FRONTIER_MONS_", "NUM_FRONTIER_MONS"))
@@ -3718,6 +4519,38 @@ class BattleFrontierPanel(QWidget):
         self.refresh_ability_choices()
         self.refresh_move_choices()
 
+    def move_matches_filters(self, move: str) -> bool:
+        if move == "MOVE_NONE":
+            return True
+        category = self.move_category_filter.currentData() if hasattr(self, "move_category_filter") else ""
+        move_type = self.move_type_filter.currentData() if hasattr(self, "move_type_filter") else ""
+        metadata = self.move_metadata.get(move, MoveMetadata("TYPE_NONE", ""))
+        if category and metadata.category != category:
+            return False
+        if move_type and metadata.type != move_type:
+            return False
+        return True
+
+    def move_label(self, move: str, sources: dict[str, set[str]], off_filter: bool = False) -> str:
+        if move == "MOVE_NONE":
+            return "なし [MOVE_NONE]"
+        metadata = self.move_metadata.get(move, MoveMetadata("TYPE_NONE", ""))
+        details = []
+        if metadata.type in TYPE_LABELS:
+            details.append(TYPE_LABELS[metadata.type])
+        if metadata.category in CATEGORY_LABELS:
+            details.append(CATEGORY_LABELS[metadata.category])
+        source_labels = []
+        if move in sources.get("level", set()): source_labels.append("Lv")
+        if move in sources.get("egg", set()): source_labels.append("Egg")
+        if move in sources.get("teachable", set()): source_labels.append("TM")
+        if source_labels:
+            details.append("/".join(source_labels))
+        if off_filter:
+            details.append("filter外")
+        suffix = f" ({' / '.join(details)})" if details else ""
+        return f"{self.move_names.get(move, move)}{suffix} [{move}]"
+
     def fill_combo(self, combo: QComboBox, values: dict[str, int], labels: dict[str, str], fallback: str) -> None:
         combo.blockSignals(True); editable = combo.isEditable(); combo.clear(); combo.setEditable(editable)
         for key, _value in sorted(values.items(), key=lambda item: item[1]):
@@ -3786,6 +4619,35 @@ class BattleFrontierPanel(QWidget):
         self.trainer_records, self.trainer_contents = indexed_records(self.window.root, [path], "FRONTIER_TRAINER_", ["facilityClass", "trainerName", "monSet"]) if path.exists() else ([], {})
         self.current_trainer = None
 
+    def load_general_trainers(self) -> None:
+        self.general_trainer_path = self.window.root / "src/data/trainers.party"; self.general_trainers.clear(); self.general_trainer_states.clear(); self.current_general_trainer = None
+        if not self.general_trainer_path.exists():
+            self.general_trainer_source = ""; return
+        self.general_trainer_source = read_utf8(self.general_trainer_path)
+        headers = list(re.finditer(r"(?m)^===\s*(TRAINER_[A-Z0-9_]+)\s*===\s*(?:\r?\n|$)", self.general_trainer_source))
+        for index, match in enumerate(headers):
+            start = match.start(); end = headers[index + 1].start() if index + 1 < len(headers) else len(self.general_trainer_source)
+            raw = self.general_trainer_source[start:end]
+            self.general_trainers.append(GeneralTrainerBlock(self.general_trainer_path, match.group(1), start, end, raw, self.trainer_party_field(raw, "Name"), self.trainer_party_field(raw, "Class"), self.trainer_party_count(raw)))
+
+    @staticmethod
+    def trainer_party_field(block: str, name: str) -> str:
+        match = re.search(rf"(?m)^{re.escape(name)}:\s*(.*)$", block)
+        return match.group(1).strip() if match else ""
+
+    @staticmethod
+    def trainer_party_count(block: str) -> int:
+        body = block.split("\n\n", 1)[1] if "\n\n" in block else ""
+        count = 0
+        for line in body.splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith(("-", "/*", "*")) or ":" in stripped:
+                continue
+            if stripped.startswith("==="):
+                continue
+            count += 1
+        return count
+
     def load_factory(self) -> None:
         self.factory_path = self.window.root / "src/battle_factory.c"; self.factory_source = read_utf8(self.factory_path) if self.factory_path.exists() else ""; self.factory_ranges.clear(); self.factory_ivs.clear(); self.range_states.clear(); self.iv_states.clear()
         self.parse_factory_ranges(); self.parse_factory_ivs(); self.rebuild_factory_usage()
@@ -3826,6 +4688,19 @@ class BattleFrontierPanel(QWidget):
                 key = self.frontier_by_value.get(value)
                 if key: self.factory_usage.add(key)
 
+    def mon_flag_values(self, record: SourceRecord) -> dict[str, bool]:
+        item = first_token(record.values.get("heldItem", ""), "ITEM_", "ITEM_NONE")
+        hold = self.item_hold_effects.get(item, "")
+        tera = first_token(record.values.get("teraType", ""), "TYPE_", "TYPE_NONE")
+        return {
+            "mega": hold == "HOLD_EFFECT_MEGA_STONE",
+            "z": hold == "HOLD_EFFECT_Z_CRYSTAL" or "_Z" in item or "Z_CRYSTAL" in item,
+            "dmax": bool_literal(record.values.get("shouldUseDynamax", "FALSE")) or bool_literal(record.values.get("gigantamaxFactor", "FALSE")) or display_integer(record.values.get("dynamaxLevel", "0")) > 0,
+            "tera": tera not in {"", "TYPE_NONE"},
+            "shiny": bool_literal(record.values.get("isShiny", "FALSE")),
+            "unused": self.mon_usage_counts.get(record.key, 0) == 0,
+        }
+
     def visible_mons(self) -> list[SourceRecord]:
         query = self.mon_search.text().casefold(); rows = []
         for record in self.records:
@@ -3840,7 +4715,8 @@ class BattleFrontierPanel(QWidget):
         rows = self.visible_mons(); self.mon_table.setRowCount(len(rows))
         for row, record in enumerate(rows):
             species = first_token(record.values.get("species", ""), "SPECIES_", "SPECIES_NONE"); item = first_token(record.values.get("heldItem", ""), "ITEM_", "ITEM_NONE")
-            values = [str(self.frontier_values.get(record.key, "")), record.key, self.species_names.get(species, species), self.item_names.get(item, item), str(self.mon_usage_counts.get(record.key, 0)), "yes" if record.key in self.factory_usage else ""]
+            flags = self.mon_flag_values(record)
+            values = [str(self.frontier_values.get(record.key, "")), record.key, self.species_names.get(species, species), self.item_names.get(item, item), str(self.mon_usage_counts.get(record.key, 0)), "yes" if record.key in self.factory_usage else "", *["✓" if flags[key] else "" for key in ("mega", "z", "dmax", "tera", "shiny", "unused")]]
             for column, value in enumerate(values):
                 item_widget = QTableWidgetItem(value); item_widget.setData(Qt.ItemDataRole.UserRole, record); self.mon_table.setItem(row, column, item_widget)
 
@@ -3860,7 +4736,10 @@ class BattleFrontierPanel(QWidget):
         }
 
     def select_mon(self) -> None:
-        self.capture_mon(); selected = self.mon_table.selectedItems()
+        previous = self.current_mon
+        if previous and not self.loading:
+            self.mon_states[previous.key] = self.values_for_mon(previous)
+        selected = self.mon_table.selectedItems()
         if not selected: return
         self.current_mon = selected[0].data(Qt.ItemDataRole.UserRole); values = self.mon_states.get(self.current_mon.key, self.default_mon_values(self.current_mon)); self.loading = True
         self.mon_nickname.setText(values["nickname"]); self.set_combo(self.mon_species, values["species"]); self.refresh_ability_choices(values["ability"]); self.refresh_item_choices(values["heldItem"])
@@ -3887,18 +4766,30 @@ class BattleFrontierPanel(QWidget):
             if move and move not in ordered: ordered.append(move)
         for move in sorted(self.move_values, key=lambda key: self.move_names.get(key, key)):
             if move not in ordered: ordered.append(move)
+        filtered = [move for move in ordered if self.move_matches_filters(move)]
+        for move in selected:
+            if move and move not in filtered:
+                filtered.append(move)
         for combo, current in zip(self.mon_moves, selected):
             combo.blockSignals(True); combo.clear(); combo.setEditable(True)
-            for move in ordered:
-                labels = []
-                if move in sources.get("level", set()): labels.append("Lv")
-                if move in sources.get("egg", set()): labels.append("Egg")
-                if move in sources.get("teachable", set()): labels.append("TM")
-                source_label = f" ({'/'.join(labels)})" if labels else ""
-                combo.addItem(f"{self.move_names.get(move, move)}{source_label} [{move}]", move)
+            for move in filtered:
+                combo.addItem(self.move_label(move, sources, off_filter=move not in ordered or not self.move_matches_filters(move)), move)
             self.set_combo(combo, current); combo.blockSignals(False)
         off_list = [move for move in selected if move not in preferred and move != "MOVE_NONE"]
-        self.move_filter_label.setText(f"Lv {len(sources.get('level', set()))} / Egg {len(sources.get('egg', set()))} / TM {len(sources.get('teachable', set()))} / Total {len(preferred)} / off-list: {', '.join(off_list) if off_list else 'none'}")
+        self.move_filter_label.setText(f"Lv {len(sources.get('level', set()))} / Egg {len(sources.get('egg', set()))} / TM {len(sources.get('teachable', set()))} / Total {len(preferred)} / shown {len(filtered)} / off-list: {', '.join(off_list) if off_list else 'none'}")
+
+    @staticmethod
+    def hidden_power_type_from_ivs(ivs: list[int]) -> str:
+        values = (ivs + [0] * 6)[:6]
+        type_bits = ((values[0] & 1) << 0) | ((values[1] & 1) << 1) | ((values[2] & 1) << 2) | ((values[3] & 1) << 3) | ((values[4] & 1) << 4) | ((values[5] & 1) << 5)
+        index = ((len(HIDDEN_POWER_TYPE_ORDER) - 1) * type_bits) // 63
+        return HIDDEN_POWER_TYPE_ORDER[index]
+
+    def current_hidden_power_type(self) -> str:
+        return self.hidden_power_type_from_ivs([box.value() for box in self.iv_boxes])
+
+    def selected_moves(self) -> list[str]:
+        return [self.combo_value(combo) or "MOVE_NONE" for combo in self.mon_moves]
 
     def values_for_mon(self, record: SourceRecord) -> dict[str, str]:
         ev_values = [box.value() for box in self.ev_boxes]; iv_values = [box.value() for box in self.iv_boxes]
@@ -3915,15 +4806,17 @@ class BattleFrontierPanel(QWidget):
             "dynamaxLevel": str(self.mon_dmax_level.value()), "tags": self.mon_tags.text().strip() or "0",
         }
 
-    def capture_mon(self) -> None:
-        if self.current_mon and not self.loading: self.mon_states[self.current_mon.key] = self.values_for_mon(self.current_mon)
+    def capture_mon(self, record: SourceRecord | None = None) -> None:
+        target = record or self.current_mon
+        if target and not self.loading:
+            self.mon_states[target.key] = self.values_for_mon(target)
 
     def proposed_mon_block(self, record: SourceRecord) -> str:
         values = dict(self.mon_states.get(record.key, self.default_mon_values(record)))
         missing_defaults = {"nickname": "", "heldItem": "ITEM_NONE", "ev": "", "iv": "", "ability": "ABILITY_NONE", "lvl": "0", "ball": "BALL_POKE", "friendship": "0", "nature": "NATURE_HARDY", "gender": "0", "isShiny": "FALSE", "teraType": "TYPE_NONE", "gigantamaxFactor": "FALSE", "shouldUseDynamax": "FALSE", "dynamaxLevel": "0", "tags": "0"}
         for field, default in missing_defaults.items():
             if raw_field(record.block, field) is None and values.get(field) == default: values[field] = ""
-        return ensure_designated_initializer_commas(replace_record_fields(record, values, {"nickname"}))
+        return ensure_designated_initializer_commas(replace_record_fields(record, values, {"nickname"}, {"nickname": "J_COMPOUND_STRING"}))
 
     def mon_changed(self) -> None:
         if self.loading or not self.current_mon: return
@@ -3932,7 +4825,10 @@ class BattleFrontierPanel(QWidget):
     def update_mon_summary(self) -> None:
         if not self.current_mon: return
         species = self.combo_value(self.mon_species); item = self.combo_value(self.mon_item); ev_total = sum(box.value() for box in self.ev_boxes)
-        self.mon_summary.setText(f"{self.current_mon.key} / {self.species_names.get(species, species)} / {self.item_names.get(item, item)} / EV {ev_total}")
+        hidden_power = self.current_hidden_power_type(); hidden_power_label = TYPE_LABELS.get(hidden_power, hidden_power)
+        uses_hidden_power = "MOVE_HIDDEN_POWER" in self.selected_moves()
+        self.hidden_power_label.setText(f"{hidden_power_label} [{hidden_power}]" + (" / 現在の技に設定あり" if uses_hidden_power else ""))
+        self.mon_summary.setText(f"{self.current_mon.key} / {self.species_names.get(species, species)} / {self.item_names.get(item, item)} / EV {ev_total} / Hidden Power {hidden_power_label}")
 
     def open_selected_move(self, slot: int) -> None:
         if 0 <= slot < len(self.mon_moves): self.window.open_move(self.combo_value(self.mon_moves[slot]))
@@ -4012,6 +4908,83 @@ class BattleFrontierPanel(QWidget):
         if not self.current_trainer: return
         inner = self.combo_value(self.trainer_monset); new_block = replace_record_fields(self.current_trainer, {"monSet": f"(const u16[]){{{inner}}}"}, set())
         DiffDialog(self, f"Diff: {self.current_trainer.key}", self.current_trainer.block, new_block).exec()
+
+    def capture_general_trainer(self) -> None:
+        if self.current_general_trainer and not self.loading:
+            self.general_trainer_states[self.current_general_trainer.key] = self.general_trainer_editor.toPlainText()
+
+    def general_trainer_text(self, block: GeneralTrainerBlock) -> str:
+        return self.general_trainer_states.get(block.key, block.raw)
+
+    def visible_general_trainers(self) -> list[GeneralTrainerBlock]:
+        query = self.general_trainer_search.text().casefold(); rows: list[GeneralTrainerBlock] = []
+        for block in self.general_trainers:
+            text = " ".join([block.key, block.name, block.trainer_class, block.raw]).casefold()
+            if not query or query in text:
+                rows.append(block)
+        return rows
+
+    @staticmethod
+    def general_trainer_flags(block: GeneralTrainerBlock) -> str:
+        flags = []
+        raw = block.raw.casefold()
+        if re.search(r"(?mi)^double battle:\s*yes", block.raw): flags.append("Double")
+        if re.search(r"(?mi)^items:\s*\S", block.raw): flags.append("Items")
+        if "shiny: yes" in raw: flags.append("Shiny")
+        if "dynamax level:" in raw or "gigantamax: yes" in raw: flags.append("DMax")
+        if "tera type:" in raw: flags.append("Tera")
+        return ", ".join(flags)
+
+    def refresh_general_trainers(self) -> None:
+        rows = self.visible_general_trainers(); self.general_trainer_table.setRowCount(len(rows))
+        for row, block in enumerate(rows):
+            dirty = self.general_trainer_text(block) != block.raw
+            values = [("*" if dirty else "") + block.key, block.name, block.trainer_class, str(block.party_count), self.general_trainer_flags(block)]
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(value); item.setData(Qt.ItemDataRole.UserRole, block); self.general_trainer_table.setItem(row, column, item)
+
+    def select_general_trainer(self) -> None:
+        previous = self.current_general_trainer
+        if previous:
+            self.capture_general_trainer()
+        selected = self.general_trainer_table.selectedItems()
+        if not selected: return
+        self.current_general_trainer = selected[0].data(Qt.ItemDataRole.UserRole)
+        self.loading = True
+        self.general_trainer_editor.setPlainText(self.general_trainer_text(self.current_general_trainer))
+        self.loading = False
+        self.general_trainer_label.setText(f"{self.current_general_trainer.key} / {self.current_general_trainer.name} / {self.current_general_trainer.trainer_class} / Pokemon {self.current_general_trainer.party_count}")
+
+    def general_trainer_changed(self) -> None:
+        if self.loading or not self.current_general_trainer: return
+        self.general_trainer_states[self.current_general_trainer.key] = self.general_trainer_editor.toPlainText()
+        self.refresh_general_trainers(); self.window.status(f"Pending trainer.party block: {self.current_general_trainer.key}")
+
+    def save_general_trainer(self) -> None:
+        self.capture_general_trainer()
+        if not self.current_general_trainer: return
+        new_block = self.general_trainer_text(self.current_general_trainer)
+        if new_block == self.current_general_trainer.raw:
+            self.window.status("No trainer.party changes"); return
+        try:
+            disk = read_utf8(self.general_trainer_path)
+            if disk[self.current_general_trainer.start:self.current_general_trainer.end] != self.current_general_trainer.raw:
+                raise RuntimeError(f"{rel(self.window.root, self.general_trainer_path)} changed on disk; reload before saving.")
+            write_with_backup(self.general_trainer_path, disk[:self.current_general_trainer.start] + new_block + disk[self.current_general_trainer.end:])
+        except (OSError, RuntimeError) as error:
+            QMessageBox.critical(self, "Save failed", str(error)); return
+        selected = self.current_general_trainer.key; self.load_general_trainers(); self.refresh_general_trainers(); self.select_general_trainer_key(selected); self.window.status(f"Saved trainer.party block: {selected}")
+
+    def show_general_trainer_diff(self) -> None:
+        self.capture_general_trainer()
+        if self.current_general_trainer:
+            DiffDialog(self, f"Diff: {self.current_general_trainer.key}", self.current_general_trainer.raw, self.general_trainer_text(self.current_general_trainer)).exec()
+
+    def select_general_trainer_key(self, key: str) -> None:
+        for row in range(self.general_trainer_table.rowCount()):
+            item = self.general_trainer_table.item(row, 0)
+            if item and item.text().lstrip("*") == key:
+                self.general_trainer_table.selectRow(row); return
 
     def refresh_macro_select(self) -> None:
         self.macro_select.blockSignals(True); self.macro_select.clear()
@@ -4135,6 +5108,7 @@ class BattleFrontierPanel(QWidget):
     def show_diff(self) -> None:
         if self.tabs.currentIndex() == 0: self.show_mon_diff()
         elif self.tabs.currentIndex() == 1: self.show_macro_diff() if self.macro_editor.hasFocus() else self.show_trainer_diff()
+        elif self.tabs.currentIndex() == 2: self.show_general_trainer_diff()
         else: self.show_factory_diff()
 
     def save(self) -> None:
@@ -4142,6 +5116,7 @@ class BattleFrontierPanel(QWidget):
         elif self.tabs.currentIndex() == 1:
             self.save_trainer()
             if self.current_macro and self.macro_editor.toPlainText() != self.current_macro.raw: self.save_macro()
+        elif self.tabs.currentIndex() == 2: self.save_general_trainer()
         else: self.save_factory()
 
 
@@ -4150,8 +5125,8 @@ class Workbench(QMainWindow):
         super().__init__(); self.settings = QSettings("PokemonDecompTools", "ExpansionStudio"); self.lang = self.settings.value("ui/language", "ja"); self.root = Path(self.settings.value("repo/root", str(Path.cwd()))); self.tool_dir = writable_tool_dir(); self.process: QProcess | None = None; self.command_log: QDialog | None = None
         self.loaded_panels: set[str] = set(); self.loading_depth = 0; self.auto_terminal_key = ""
         self.setStatusBar(QStatusBar()); self.make_toolbar(); self.loading_label = QLabel("読み込み中..."); self.loading_label.setVisible(False); self.statusBar().addPermanentWidget(self.loading_label); self.tabs = QTabWidget(); self.setCentralWidget(self.tabs)
-        self.translation = TranslationPanel(self); self.constants = ConstantsPanel(self); self.files = FileSearchPanel(self); self.species = PokemonStudioPanel(self); self.moves = MoveStudioPanel(self); self.frontier = BattleFrontierPanel(self); self.assets = AssetPanel(self); self.dependencies = DependencyPanel(self); self.fonts = FontPanel(self); self.poryscript = PoryscriptPanel(self); self.tool_settings = SettingsPanel(self)
-        self.panels: list[tuple[str, QWidget, Callable[[], None] | None]] = [("translation", self.translation, self.translation.load), ("constants", self.constants, self.constants.load), ("files", self.files, None), ("species", self.species, self.species.load), ("moves", self.moves, self.moves.load), ("frontier", self.frontier, self.frontier.load), ("assets", self.assets, self.assets.load), ("dependencies", self.dependencies, None), ("fonts", self.fonts, self.fonts.load), ("poryscript", self.poryscript, self.poryscript.load), ("settings", self.tool_settings, self.tool_settings.load)]
+        self.translation = TranslationPanel(self); self.constants = ConstantsPanel(self); self.files = FileSearchPanel(self); self.index = CodeIndexPanel(self); self.species = PokemonStudioPanel(self); self.moves = MoveStudioPanel(self); self.frontier = BattleFrontierPanel(self); self.assets = AssetPanel(self); self.dependencies = DependencyPanel(self); self.fonts = FontPanel(self); self.poryscript = PoryscriptPanel(self); self.tool_settings = SettingsPanel(self)
+        self.panels: list[tuple[str, QWidget, Callable[[], None] | None]] = [("translation", self.translation, self.translation.load), ("constants", self.constants, self.constants.load), ("files", self.files, None), ("index", self.index, self.index.load), ("species", self.species, self.species.load), ("moves", self.moves, self.moves.load), ("frontier", self.frontier, self.frontier.load), ("assets", self.assets, self.assets.load), ("dependencies", self.dependencies, None), ("fonts", self.fonts, self.fonts.load), ("poryscript", self.poryscript, self.poryscript.load), ("settings", self.tool_settings, self.tool_settings.load)]
         for key, panel, _loader in self.panels: self.tabs.addTab(panel, tr(key, self.lang))
         self.tabs.currentChanged.connect(lambda _index: self.load_current())
         self.retranslate(); self.apply_readability_style(); self.resize(1580, 960)
@@ -4169,6 +5144,10 @@ class Workbench(QMainWindow):
         """)
         for table in self.findChildren(QTableWidget):
             configure_table(table)
+        for combo in self.findChildren(QComboBox):
+            stabilize_combo(combo)
+        for splitter in self.findChildren(QSplitter):
+            stabilize_splitter(splitter)
 
     def make_toolbar(self) -> None:
         bar = QToolBar(); self.addToolBar(bar); self.root_label = QLabel(); bar.addWidget(self.root_label); self.root_edit = QLineEdit(str(self.root)); self.root_edit.setMinimumWidth(450); bar.addWidget(self.root_edit)

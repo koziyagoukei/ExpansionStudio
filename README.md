@@ -1,37 +1,49 @@
 # Expansion Studio
 
-⚠ Experimental Alpha
+[日本語版はこちら](./読んでね.md)
+
+⚠ **Experimental Alpha**
+
+Expansion Studio is a desktop workbench for Pokémon decompilation projects, with a focus on `pokeemerald-expansion`.
+
+It provides project-wide browsing, text editing, asset management, Poryscript assistance, Battle Frontier editing, general trainer block editing, command launching, and source indexing.
 
 Always commit your changes before using this tool.
 Back up your repository.
 
-Desktop workbench for this Japanese `pokeemerald-expansion` localization project.
+This application edits repository source files directly. Source data remains the authority. Expansion Studio tries to make conservative edits and creates `.bak` backups before overwriting source files, but it is still an alpha tool.
 
-The application reads the repository source files directly. Source data remains
-the authority; the tool makes conservative edits and creates a `.bak` backup
-before it overwrites a source file.
-This project is not affiliated with Nintendo, Game Freak, or The Pokémon Company.
+This project is not affiliated with Nintendo, Game Freak, Creatures, or The Pokémon Company.
 
 This project is licensed under the MIT License.
 
-<img width="2745" height="1567" alt="image" src="https://github.com/user-attachments/assets/89e17a2f-0fff-4d14-9d4c-08bc04efe935" />
-<img width="2745" height="1593" alt="image" src="https://github.com/user-attachments/assets/4112d8b5-cbc6-4b5f-bb29-e9a3195679bf" />
-<img width="2745" height="1593" alt="image" src="https://github.com/user-attachments/assets/10b05b73-032f-4c73-ba5d-1f49cd487134" />
+## Download
 
-Supported
-
-✓ pokeemerald-expansion
-✓ pokeemerald
-△ pokefirered
+Latest releases are available here:
 
 https://github.com/koziyagoukei/ExpansionStudio/releases
 
+## Supported Projects
+
+Current support is best for:
+
+* `pokeemerald-expansion`
+* `pokeemerald`
+
+Partial or experimental support:
+
+* `pokefirered`
+
+Other Pokémon decompilation projects may open, but parsers and editors may not fully understand their layouts.
+
 ## Requirements
+
+To run from source:
 
 * Python 3.10 or later
 * PySide6
 
-Install the Python dependency from the repository root:
+Install dependencies from the repository root:
 
 ```powershell
 python -m pip install -r "requirements.txt"
@@ -43,94 +55,367 @@ python -m pip install -r "requirements.txt"
 python "ExpansionStudio.py"
 ```
 
-Select the repository root when prompted, or set it in the toolbar. A valid
-root contains both `src` and `include`.
+When prompted, select the repository root.
+A valid project root should contain at least `src` and `include`.
 
-## Available workspaces
+## Executable Build
 
-* **Translation**: finds `_()` and `COMPOUND_STRING()` text in `src` and
-  `include`; supports search, filename filtering, untranslated/changed filters,
-  UTF-8 text edits, character count, CSV import/export, and backups. Its Event
-  Browser recursively scans repository `.inc` files, listing each `.string`
-  definition with its label, body, path, line, use count, and definition type.
-  It displays `msgbox` / `message` text in an event tree, searches labels and
-  text together, and lets you follow references in both directions. The
-  terminal `$` is hidden during INC editing and restored when saved. Definitions
-  are identified by type, relative path, and label; an INC/Poryscript name
-  collision is deliberately left unresolved instead of guessing a target.
-  Supported `.string` and existing C text can be edited and saved with backups.
-* **Constants**: browses `#define` values and enum-style constants under
-  `include/constants`.
-* **File Search**: searches source, data, Makefile, and text files and copies a
-  selected `path:line` location to the clipboard.
-* **Pokemon**: uses a development-oriented detail view with Basic, Stats,
-  Abilities, Evolutions, Moves, Pokedex, and Graphics tabs. It shows localized
-  type names, total base stats, ability descriptions, evolution links,
-  level-up moves, front graphics, and cry IDs. Double-click a move or evolution
-  to jump to its detailed record. Level-up, egg, and teachable move lists can
-  be selected from their actual source files, edited, diffed, and saved with a
-  backup. The evolution expression can also be edited while retaining complex
-  project-specific conditions.
-* **Moves**: shows localized type/category labels, power, accuracy, PP, effect
-  summary, critical-hit stage, and selectable flags such as contact, punching,
-  sound, and wind. The Additional Effects tab supports effects such as a 10%
-  paralysis chance, including chance and self-target settings. It also lists
-  static source references for the selected move.
-* **Assets**: shows PNG-backed image groups by default. A group includes the
-  related `.gbapal`, `.pal`, `.bin`, and `.4bpp` files with the same base path.
-  It shows static reference locations and labels zero-reference groups as
-  **unused candidates**, with path, unused-first, and reference-count sorting.
-  Candidate removal moves the whole group to `quarantine/assets/<timestamp>/`
-  instead of deleting it. Enable the non-PNG filter for groups without a PNG.
-* **Dependencies**: shows static textual references for a file path, constant,
-  symbol, species ID, or move ID.
-* **Glyph Table**: manages the selected font PNG as 8x16 glyph cells by Glyph
-  ID. It lists mapped characters, image previews, measured widths, static use
-  counts, and use locations; supports Glyph ID/character search and unused
-  glyph filtering. Normal charmap mappings can be added, changed, or removed
-  with a backup of `charmap.txt`. It does not use automatic language profiles:
-  the selected Glyph ID is always the unit of inspection and editing.
-* **Poryscript**: recursively searches `.pory` files, supports filename/body/
-  label search, edits one file at a time with backups, marks unsaved files, and
-  shows compile stdout/stderr. New files can start blank or from a managed
-  template in `workspace/templates/poryscript`; template variables such as
-  `{{SCRIPT_NAME}}` and `{{MESSAGE}}` are entered in a form and previewed
-  before writing. An existing `.inc` can also be saved as a Poryscript `raw`
-  block without changing the original assembly source. Editing and creation
-  work without Poryscript installed.
-* **Settings**: stores the external Poryscript executable, source directory,
-  and output directory separately from the event editor.
+`em.png` is used as the window and executable icon.
 
-The UI language can be switched between Japanese and English from the toolbar.
-The same toolbar provides pending diff, save, build, ROM launch, and build/ROM
-command configuration actions. Set the command once before running it; commands
-are executed with the selected repository root as their working directory.
-
-## Build a Windows executable
-
-`em.png` is used as the window and executable icon. Install the build
-requirements, then run the bundled builder from this directory:
+To build the Windows executable:
 
 ```powershell
 python -m pip install -r "workspace\requirements-build.txt"
 python "workspace\build_exe.py"
 ```
 
-The distributable application is created under
-`workspace\dist\ExpansionStudio.exe`.
-When the executable first opens Poryscript templates, it copies the bundled
-defaults into `workspace\dist\templates\poryscript`; that folder is the
-editable template location for the standalone application.
+The executable is created under:
 
-## Current limits
+```text
+workspace\dist\ExpansionStudio.exe
+```
 
-* The C parser is intentionally limited. Complex or unrecognized expressions
-  are displayed but are not rewritten automatically.
-* Static reference results do not prove that an asset has no dynamic or
-  build-generated use. Confirm a clean build after deleting assets.
-* Species and move deletion does not renumber or remove internal constants.
-  This prevents accidental ABI/data-table corruption.
-* Poryscript is currently a source editor. `.inc` import intentionally starts
-  as a `raw` block, rather than attempting an unsafe automatic rewrite. Flowchart
-  rendering and structured graphical editing are not yet implemented.
-* Trainer, battle AI, and map editors are out of scope for the current version.
+## UI Language
+
+The UI language can be switched between Japanese and English from the toolbar.
+
+A Japanese README is planned separately as:
+
+```text
+読んでね.md
+```
+
+## Main Workspaces
+
+### Translation
+
+The Translation workspace scans source text definitions such as:
+
+* `_()`
+* `COMPOUND_STRING()`
+* `.string` definitions in event `.inc` files
+
+Features include:
+
+* Search
+* Filename filtering
+* Untranslated / changed filters
+* UTF-8 text editing
+* Character count
+* CSV import / export
+* Diff preview
+* Backup creation
+* Event browser
+* Reference navigation
+* Automatic text formatting
+
+The automatic formatting tool can insert line breaks based on configurable width rules and shows a diff preview before applying changes.
+
+### Constants
+
+Browses constants from project headers, mainly under:
+
+```text
+include/constants
+```
+
+It is useful for checking species, moves, items, abilities, flags, vars, and related constants.
+
+### File Search
+
+Performs plain source-file text search.
+
+Use this when you want raw text search rather than indexed symbol search.
+
+### Index
+
+The Index workspace builds a project-wide definition index.
+
+Indexed entries include:
+
+* Constants
+* `gText_*`
+* `COMPOUND_STRING`
+* Script labels
+* Macros
+* Enums
+* Structs
+
+Features:
+
+* Fast search by name, value, preview, or file path
+* Type filter
+* File path filter
+* Source preview
+* Open file
+* Jump to line
+* Copy name
+* Copy relative path
+* Find references
+* Re-index button
+
+The index is cached under:
+
+```text
+.expansionstudio/index.json
+```
+
+The `.expansionstudio/` directory should not be committed.
+
+### Pokémon
+
+The Pokémon workspace provides a development-oriented Pokémon data viewer and editor.
+
+It includes tabs for:
+
+* Basic data
+* Stats
+* Abilities
+* Evolutions
+* Moves
+* Pokédex
+* Graphics
+
+Features include:
+
+* Localized type display
+* Base stat total
+* Ability descriptions
+* Evolution links
+* Level-up moves
+* Egg moves
+* Teachable moves
+* Front graphics preview
+* Cry ID display
+* Diff preview
+* Backup creation
+
+### Moves
+
+The Moves workspace shows and edits move data.
+
+Displayed information includes:
+
+* Type
+* Category
+* Power
+* Accuracy
+* PP
+* Effect summary
+* Critical-hit stage
+* Flags such as contact, punching, sound, wind, and more
+* Additional effects
+
+Move lists can be filtered by type and category.
+
+### Assets
+
+The Assets workspace helps browse, add, and replace graphics-related files.
+
+It can group related files such as:
+
+* `.png`
+* `.gbapal`
+* `.pal`
+* `.bin`
+* `.4bpp`
+
+Features:
+
+* Asset grouping
+* Reference display
+* Unused candidate display
+* Sorting by path, unused state, and reference count
+* Add assets under `graphics`
+* Replace selected assets
+* `.bak` backup before overwrite
+* Basic replacement checks
+
+Replacement checks include:
+
+* Extension mismatch
+* PNG readability
+* 16-color warning for 4bpp targets
+* 8px tile-size warning
+* Odd-size warning for `.gbapal`
+* 32-byte alignment warning for raw `.4bpp`
+
+Expansion Studio does not directly convert PNG to 4bpp or LZ77.
+It replaces source assets safely and lets the existing build system handle `INCGFX_*` / `INCBIN_*` conversion.
+
+### Glyph Table
+
+The Glyph Table workspace manages font PNG glyph cells by Glyph ID.
+
+Features:
+
+* 8x16 glyph cell preview
+* Character mapping display
+* Measured width display
+* Static use count
+* Use locations
+* Glyph ID search
+* Character search
+* Unused glyph filtering
+* `charmap.txt` editing with backups
+
+The selected Glyph ID is always the inspection and editing unit.
+
+### Poryscript
+
+The Poryscript workspace searches and edits `.pory` files.
+
+Features:
+
+* Recursive `.pory` search
+* Filename / body / label search
+* One-file-at-a-time editing
+* Unsaved marker
+* Backup creation
+* Compile stdout / stderr display
+* Poryscript folder setting
+* Auto-detection of `poryscript.exe` / `poryscript`
+* Helper insert dropdowns
+
+Helper insert categories include:
+
+* `look`
+* `text / msgbox`
+* `text / yes-no`
+* `movement`
+* `flow`
+* `giveitem`
+* `trainerbattle`
+* `warp`
+
+Editing and file creation work even when Poryscript is not installed. Compilation requires a valid Poryscript folder.
+
+### Battle Frontier
+
+The Battle Frontier workspace edits Battle Frontier-related data.
+
+Supported editing includes:
+
+* `gBattleFrontierMons`
+* Species
+* Held item
+* Ability
+* Nature
+* Ball
+* Gender
+* Moves
+* EVs
+* IVs
+* Tera type
+* Dynamax settings
+* Gigantamax flag
+* Shiny flag
+* Tags
+
+Move selection prioritizes species learnsets while still allowing all `MOVE_*` constants, so existing special sets are not accidentally destroyed.
+
+The Pokémon list also displays overview columns:
+
+* Mega
+* Z
+* DMax
+* Tera
+* Shiny
+* Unused
+
+Unused status is based on Battle Frontier trainer pool references.
+It does not prove that the entry is unused everywhere in the project.
+
+Battle Factory-related tables are also partially supported, including rental ranges and fixed IV tables.
+
+### General Trainers
+
+The General Trainers workspace edits trainer source blocks from:
+
+```text
+src/data/trainers.party
+```
+
+It intentionally does not edit:
+
+```text
+src/data/trainers.h
+```
+
+because `trainers.h` is an auto-generated file.
+
+Features:
+
+* TRAINER block listing
+* Trainer name display
+* Trainer class display
+* Party size display
+* Basic flag display
+* Block text editing
+* Diff preview
+* Save
+* `.bak` backup creation
+
+This workspace currently focuses on safe block editing rather than fully structured trainer-party editing.
+
+### Command Launcher
+
+The toolbar provides terminal and script launcher features.
+
+Features:
+
+* Open terminal
+* Registered scripts 1-5
+* Per-script confirmation toggle
+* Last executed script marker
+* Execution log dialog
+* stdout / stderr display
+* Exit code display
+* Terminal type presets
+
+Supported terminal types include:
+
+* PowerShell
+* cmd
+* WSL
+* Windows Terminal
+
+Template variables include:
+
+* `{ROOT}`: current repository root
+* `{WSL_ROOT}`: WSL-style `/mnt/c/...` root path
+* `{SCRIPT}`: registered script body
+
+Terminal and script behavior may require adjustment depending on your environment.
+
+## Safety Notes
+
+Expansion Studio is designed to avoid destructive edits where possible, but it is still an alpha tool.
+
+Before using it:
+
+1. Commit your current work.
+2. Back up your repository.
+3. Review diffs before saving.
+4. Run a clean build after major edits.
+
+The tool may create `.bak` files before overwriting source files.
+
+## Current Limits
+
+* The C parser is intentionally lightweight.
+* Complex or unrecognized expressions may be displayed but not safely rewritten.
+* Static reference results do not prove that an asset or symbol has no dynamic use.
+* Asset deletion or quarantine should always be followed by a clean build.
+* Species and move deletion does not renumber constants.
+* Poryscript `.inc` import starts as a raw block rather than attempting unsafe automatic conversion.
+* General Trainers currently edits source blocks, not every trainer field through structured GUI controls.
+* Some features are optimized for `pokeemerald-expansion` and may not fully work on other projects.
+
+## Legal Notice
+
+This repository does not include ROM files.
+
+Users are responsible for using their own legally obtained materials and for following the laws of their region.
+
+Expansion Studio is an unofficial development utility and is not affiliated with Nintendo, Game Freak, Creatures, or The Pokémon Company.

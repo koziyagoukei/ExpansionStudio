@@ -2,6 +2,15 @@
 
 [日本語版はこちら](./読んでね.md)
 
+
+<img width="1272" height="629" alt="{4920A1A0-487F-4E11-B63B-00AAFE0E0FD5}" src="https://github.com/user-attachments/assets/2a8c62ed-d9e4-43ed-a544-c82b9df520ef" />
+
+<img width="1277" height="608" alt="{9AA5EBA7-D333-4692-A937-1572E98721AE}" src="https://github.com/user-attachments/assets/56d90690-b957-48b9-bd11-4ecb67cbc630" />
+
+<img width="1278" height="695" alt="{15AAD7FE-4E06-4560-A418-C0089C2478DD}" src="https://github.com/user-attachments/assets/a66d8995-6516-48a1-83e5-889e445e50b5" />
+
+<img width="1270" height="674" alt="{D976C5BA-CDCB-46C3-8167-1013118BD728}" src="https://github.com/user-attachments/assets/546d2302-5c11-4c03-8e6f-6abde1c92f80" />
+
 ⚠ **Experimental Alpha**
 
 Expansion Studio is a desktop workbench for Pokémon decompilation projects, with a focus on `pokeemerald-expansion`.
@@ -88,6 +97,7 @@ A Japanese README is planned separately as:
 ## Main Workspaces
 
 ### Translation
+
 
 The Translation workspace scans source text definitions such as:
 

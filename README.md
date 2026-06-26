@@ -18,7 +18,11 @@ This project is licensed under the MIT License.
 <img width="2745" height="1593" alt="image" src="https://github.com/user-attachments/assets/4112d8b5-cbc6-4b5f-bb29-e9a3195679bf" />
 <img width="2745" height="1593" alt="image" src="https://github.com/user-attachments/assets/10b05b73-032f-4c73-ba5d-1f49cd487134" />
 
+Supported
 
+✓ pokeemerald-expansion
+✓ pokeemerald
+△ pokefirered
 
 https://github.com/koziyagoukei/ExpansionStudio/releases
 

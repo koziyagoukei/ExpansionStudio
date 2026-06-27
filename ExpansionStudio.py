@@ -9,6 +9,7 @@ are not rewritten automatically.
 from __future__ import annotations
 
 import csv
+import copy
 import difflib
 import json
 import os
@@ -112,7 +113,9 @@ LANG = {
 }
 LANG["ja"]["index"] = "インデックス"
 LANG["ja"]["rom_layout"] = "ROM Layout"
+LANG["ja"]["maps"] = "Maps / Encounters"
 LANG["en"]["rom_layout"] = "ROM Layout"
+LANG["en"]["maps"] = "Maps / Encounters"
 
 
 def tr(key: str, lang: str) -> str:
@@ -173,6 +176,10 @@ def backup_path(path: Path) -> Path:
 def write_with_backup(path: Path, content: str) -> None:
     shutil.copy2(path, backup_path(path))
     path.write_text(content, encoding="utf-8", newline="")
+
+
+def dump_json(data: object) -> str:
+    return json.dumps(data, ensure_ascii=False, indent=2) + "\n"
 
 
 def copy_with_backup(source: Path, target: Path) -> None:
@@ -4600,6 +4607,528 @@ class TrainerPartyMonBlock:
     item: str
 
 
+class MapEncounterPanel(QWidget):
+    """Map weather and wild encounter JSON editor."""
+    RANDOM_FRONTIER_WEATHERS = [
+        "WEATHER_NONE",
+        "WEATHER_SUNNY_CLOUDS",
+        "WEATHER_SUNNY",
+        "WEATHER_RAIN",
+        "WEATHER_SNOW",
+        "WEATHER_RAIN_THUNDERSTORM",
+        "WEATHER_FOG_HORIZONTAL",
+        "WEATHER_SANDSTORM",
+        "WEATHER_SHADE",
+        "WEATHER_FOG",
+    ]
+    WEATHER_POOL_EXCLUDES = {"WEATHER_COUNT", "WEATHER_RANDOM_FRONTIER", "WEATHER_DYNAMIC"}
+
+    def __init__(self, window: "Workbench") -> None:
+        super().__init__(); self.window = window; self.loading = False
+        self.map_records: list[dict[str, object]] = []; self.map_by_id: dict[str, dict[str, object]] = {}
+        self.encounter_path = Path(); self.encounter_original = ""; self.encounter_data: dict[str, object] = {}; self.encounter_dirty = False
+        self.wild_group: dict[str, object] | None = None; self.encounters: list[dict[str, object]] = []; self.encounter_by_map: dict[str, list[dict[str, object]]] = {}
+        self.field_specs: list[dict[str, object]] = []; self.field_by_type: dict[str, dict[str, object]] = {}
+        self.weather_values: dict[str, int] = {}; self.weather_names: list[str] = []
+        self.species_values: dict[str, int] = {}; self.species_names: dict[str, str] = {}
+        self.time_labels: dict[str, str] = {}; self.time_fallback = "TIME_MORNING"
+        self.current_map: dict[str, object] | None = None; self.current_encounter: dict[str, object] | None = None
+        self.build()
+
+    @staticmethod
+    def combo() -> QComboBox:
+        combo = QComboBox(); stabilize_combo(combo); return combo
+
+    @staticmethod
+    def set_columns(table: QTableWidget, widths: list[int]) -> None:
+        for column, width in enumerate(widths):
+            table.setColumnWidth(column, width)
+
+    @staticmethod
+    def combo_value(combo: QComboBox) -> str:
+        data = combo.currentData()
+        if isinstance(data, str):
+            return data
+        return combo.currentText().strip()
+
+    @staticmethod
+    def set_combo(combo: QComboBox, data: str) -> None:
+        index = combo.findData(data); combo.setCurrentIndex(index if index >= 0 else 0)
+
+    def set_species_combo(self, species: str) -> None:
+        if self.slot_species.findData(species) < 0:
+            self.slot_species.insertItem(0, self.species_label(species), species)
+        self.set_combo(self.slot_species, species)
+
+    def build(self) -> None:
+        layout = QVBoxLayout(self); split = QSplitter(Qt.Orientation.Horizontal)
+        left = QWidget(); left.setMinimumWidth(LIST_PANEL_MIN_WIDTH); left_layout = QVBoxLayout(left)
+        filters = QHBoxLayout(); self.map_search = QLineEdit(); self.map_search.setPlaceholderText("MAP_ROUTE101 / Route101 / WEATHER_RANDOM_FRONTIER"); self.map_search.textChanged.connect(self.refresh_maps); filters.addWidget(self.map_search)
+        self.random_only = QCheckBox("Random weather maps"); self.random_only.stateChanged.connect(self.refresh_maps); filters.addWidget(self.random_only)
+        self.pool_only = QCheckBox("Weather pools only"); self.pool_only.stateChanged.connect(self.refresh_maps); filters.addWidget(self.pool_only); left_layout.addLayout(filters)
+        self.map_table = QTableWidget(0, 6); self.map_table.setHorizontalHeaderLabels(["*", "Map", "Name", "Weather", "Encounter", "Pools"]); self.map_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows); self.map_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers); self.map_table.itemSelectionChanged.connect(self.select_map); left_layout.addWidget(self.map_table)
+        self.set_columns(self.map_table, [34, 260, 230, 210, 180, 70]); split.addWidget(left)
+
+        right = QWidget(); right.setMinimumWidth(DETAIL_PANEL_MIN_WIDTH); right_layout = QVBoxLayout(right)
+        self.summary = QLabel("Select a map."); self.summary.setStyleSheet("font-size: 18px; font-weight: 700;"); self.summary.setMinimumHeight(34); right_layout.addWidget(self.summary)
+        map_box = QGroupBox("Map weather"); map_form = QFormLayout(map_box); self.map_weather = self.combo(); self.map_weather.currentIndexChanged.connect(self.map_weather_changed); map_form.addRow("weather", self.map_weather); right_layout.addWidget(map_box)
+
+        encounter_box = QGroupBox("Wild encounter"); encounter_layout = QVBoxLayout(encounter_box)
+        encounter_form = QFormLayout(); self.encounter_select = self.combo(); self.encounter_select.currentIndexChanged.connect(self.select_encounter); encounter_form.addRow("time / label", self.encounter_select)
+        self.time_add = self.combo(); add_time = QPushButton("Add time copy"); add_time.clicked.connect(self.add_time_variant); time_row = QHBoxLayout(); time_row.addWidget(self.time_add); time_row.addWidget(add_time); encounter_form.addRow("new time", time_row); encounter_layout.addLayout(encounter_form)
+
+        pool_row = QHBoxLayout(); self.pool_select = self.combo(); self.pool_select.currentIndexChanged.connect(self.select_pool); self.add_weather = self.combo(); add_pool = QPushButton("Add pool"); add_pool.clicked.connect(self.add_weather_pool); delete_pool = QPushButton("Delete pool"); delete_pool.clicked.connect(self.delete_weather_pool)
+        pool_row.addWidget(QLabel("pool")); pool_row.addWidget(self.pool_select); pool_row.addWidget(QLabel("target weather")); pool_row.addWidget(self.add_weather); pool_row.addWidget(add_pool); pool_row.addWidget(delete_pool); encounter_layout.addLayout(pool_row)
+
+        area_row = QHBoxLayout(); self.area_select = self.combo(); self.area_select.currentIndexChanged.connect(self.select_area); self.encounter_rate = QSpinBox(); self.encounter_rate.setRange(0, 100); self.encounter_rate.valueChanged.connect(self.area_rate_changed)
+        copy_area = QPushButton("Copy/create area"); copy_area.clicked.connect(self.copy_or_create_area); delete_area = QPushButton("Delete weather area"); delete_area.clicked.connect(self.delete_weather_area)
+        area_row.addWidget(QLabel("area")); area_row.addWidget(self.area_select); area_row.addWidget(QLabel("rate")); area_row.addWidget(self.encounter_rate); area_row.addWidget(copy_area); area_row.addWidget(delete_area); encounter_layout.addLayout(area_row)
+
+        self.mons_table = QTableWidget(0, 5); self.mons_table.setHorizontalHeaderLabels(["Slot", "Chance", "Min", "Max", "Species"]); self.mons_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows); self.mons_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers); self.mons_table.itemSelectionChanged.connect(self.select_mon_slot); encounter_layout.addWidget(self.mons_table); self.set_columns(self.mons_table, [54, 74, 58, 58, 300])
+        species_row = QHBoxLayout(); self.species_filter = QLineEdit(); self.species_filter.setPlaceholderText("species filter"); self.species_filter.textChanged.connect(self.refresh_species_combo); self.slot_species = self.combo(); self.slot_min = QSpinBox(); self.slot_min.setRange(1, 100); self.slot_max = QSpinBox(); self.slot_max.setRange(1, 100); apply_slot = QPushButton("Apply slot"); apply_slot.clicked.connect(self.apply_slot)
+        species_row.addWidget(self.species_filter); species_row.addWidget(self.slot_species); species_row.addWidget(QLabel("min")); species_row.addWidget(self.slot_min); species_row.addWidget(QLabel("max")); species_row.addWidget(self.slot_max); species_row.addWidget(apply_slot); encounter_layout.addLayout(species_row)
+        right_layout.addWidget(encounter_box)
+
+        buttons = QHBoxLayout(); diff = QPushButton("Diff"); diff.clicked.connect(self.show_diff); save = QPushButton("Save maps/encounters"); save.clicked.connect(self.save); buttons.addStretch(); buttons.addWidget(diff); buttons.addWidget(save); right_layout.addLayout(buttons); split.addWidget(right)
+        stabilize_splitter(split, 1, 1); split.setSizes([780, 760]); layout.addWidget(split)
+
+    def reset_loaded(self) -> None:
+        self.map_records.clear(); self.map_by_id.clear(); self.encounter_data = {}; self.encounter_original = ""; self.encounter_dirty = False
+        self.wild_group = None; self.encounters = []; self.encounter_by_map.clear(); self.current_map = None; self.current_encounter = None
+
+    def load(self) -> None:
+        if not self.window.root_valid(): return
+        self.load_weather_values(); self.load_time_reference(); self.load_species_reference(); self.load_maps(); self.load_encounters()
+        self.populate_static_combos(); self.refresh_maps(); self.window.status(f"Loaded {len(self.map_records)} maps and {len(self.encounters)} encounter records")
+
+    def load_weather_values(self) -> None:
+        self.weather_values = define_values(self.window.root / "include/constants/weather.h", ("WEATHER_",))
+        self.weather_names = [name for name, _value in sorted(self.weather_values.items(), key=lambda item: item[1]) if name != "WEATHER_COUNT"]
+        if not self.weather_names:
+            self.weather_names = list(self.RANDOM_FRONTIER_WEATHERS) + ["WEATHER_RANDOM_FRONTIER"]
+
+    def load_time_reference(self) -> None:
+        self.time_labels = {}; self.time_fallback = "TIME_MORNING"
+        rtc = self.window.root / "include/constants/rtc.h"
+        if rtc.exists():
+            source = read_utf8(rtc)
+            match = re.search(r"enum\s+TimeOfDay\s*\{(?P<body>.*?)\}\s*;", source, re.S)
+            if match:
+                for name in re.findall(r"\b(TIME_[A-Z0-9_]+)\b", match.group("body")):
+                    self.time_labels[name] = name.title().replace("Time_", "").replace("_", "")
+        config = self.window.root / "include/config/overworld.h"
+        if config.exists():
+            match = re.search(r"(?m)^\s*#define\s+OW_TIME_OF_DAY_FALLBACK\s+(TIME_[A-Z0-9_]+)\b", read_utf8(config))
+            if match:
+                self.time_fallback = match.group(1)
+        if not self.time_labels:
+            self.time_labels = {"TIME_MORNING": "Morning", "TIME_DAY": "Day", "TIME_EVENING": "Evening", "TIME_NIGHT": "Night"}
+
+    def load_species_reference(self) -> None:
+        root = self.window.root
+        self.species_values = enum_values(root / "include/constants/species.h", "SPECIES_")
+        species_paths = list((root / "src/data/pokemon/species_info").glob("*_families.h")) + [root / "src/data/pokemon/species_info.h"]
+        records, _contents = indexed_records(root, [path for path in species_paths if path.exists()], "SPECIES_", ["speciesName"])
+        self.species_names = {record.key: string_from_record(record, "speciesName") for record in records}
+
+    def load_maps(self) -> None:
+        self.map_records.clear(); self.map_by_id.clear()
+        for path in sorted((self.window.root / "data/maps").glob("*/map.json")):
+            source = read_utf8(path)
+            data = json.loads(source)
+            map_id = str(data.get("id", path.parent.name))
+            record = {"path": path, "data": data, "original": source, "dirty": False}
+            self.map_records.append(record); self.map_by_id[map_id] = record
+
+    def load_encounters(self) -> None:
+        self.encounter_path = self.window.root / "src/data/wild_encounters.json"
+        self.encounter_original = read_utf8(self.encounter_path) if self.encounter_path.exists() else "{}\n"
+        self.encounter_data = json.loads(self.encounter_original)
+        groups = self.encounter_data.get("wild_encounter_groups", [])
+        self.wild_group = next((group for group in groups if group.get("label") == "gWildMonHeaders"), None)
+        if self.wild_group is None:
+            self.wild_group = next((group for group in groups if group.get("for_maps")), groups[0] if groups else None)
+        self.field_specs = list(self.wild_group.get("fields", [])) if self.wild_group else []
+        self.field_by_type = {str(field.get("type")): field for field in self.field_specs}
+        self.encounters = list(self.wild_group.get("encounters", [])) if self.wild_group else []
+        self.rebuild_encounter_index(); self.encounter_dirty = False
+
+    def rebuild_encounter_index(self) -> None:
+        self.encounter_by_map.clear()
+        for encounter in self.encounters:
+            self.encounter_by_map.setdefault(str(encounter.get("map", "")), []).append(encounter)
+
+    def populate_static_combos(self) -> None:
+        self.fill_combo(self.map_weather, self.weather_names)
+        pool_choices = self.weather_pool_choices()
+        self.fill_combo(self.add_weather, pool_choices)
+        self.fill_combo(self.area_select, [str(field.get("type")) for field in self.field_specs])
+        self.fill_combo(self.time_add, list(self.time_labels.keys()), self.time_labels)
+        self.refresh_species_combo()
+
+    def fill_combo(self, combo: QComboBox, keys: list[str], labels: dict[str, str] | None = None) -> None:
+        labels = labels or {}
+        combo.blockSignals(True); combo.clear()
+        for key in keys:
+            label = labels.get(key, key)
+            combo.addItem(f"{label} [{key}]" if label != key else key, key)
+        combo.blockSignals(False)
+
+    def weather_pool_choices(self) -> list[str]:
+        preferred = [weather for weather in self.RANDOM_FRONTIER_WEATHERS if weather in self.weather_names]
+        rest = [weather for weather in self.weather_names if weather not in preferred and weather not in self.WEATHER_POOL_EXCLUDES]
+        return preferred + rest
+
+    def map_encounters(self, map_id: str) -> list[dict[str, object]]:
+        return self.encounter_by_map.get(map_id, [])
+
+    def map_pool_weathers(self, map_id: str) -> list[str]:
+        weathers: set[str] = set()
+        for encounter in self.map_encounters(map_id):
+            weather_data = encounter.get("weather_encounters", {})
+            if isinstance(weather_data, dict):
+                weathers.update(str(weather) for weather in weather_data)
+        return sorted(weathers, key=lambda name: self.weather_values.get(name, 9999))
+
+    def encounter_time_info(self, encounter: dict[str, object]) -> tuple[str, str]:
+        base_label = str(encounter.get("base_label", ""))
+        for time, label in self.time_labels.items():
+            suffix = "_" + label
+            if base_label.endswith(suffix):
+                return base_label[:-len(suffix)], time
+        return base_label, self.time_fallback
+
+    def encounter_display(self, encounter: dict[str, object]) -> str:
+        shared, time = self.encounter_time_info(encounter)
+        return f"{self.time_labels.get(time, time)} / {encounter.get('base_label', shared)}"
+
+    def refresh_maps(self) -> None:
+        query = self.map_search.text().casefold() if hasattr(self, "map_search") else ""
+        current_id = str(self.current_map["data"].get("id", "")) if self.current_map else ""
+        rows: list[dict[str, object]] = []
+        for record in self.map_records:
+            data = record["data"]
+            if not isinstance(data, dict):
+                continue
+            map_id = str(data.get("id", ""))
+            weather = str(data.get("weather", ""))
+            pools = self.map_pool_weathers(map_id)
+            searchable = " ".join([map_id, str(data.get("name", "")), weather, " ".join(pools)]).casefold()
+            if self.random_only.isChecked() and weather != "WEATHER_RANDOM_FRONTIER":
+                continue
+            if self.pool_only.isChecked() and not pools:
+                continue
+            if query and query not in searchable:
+                continue
+            rows.append(record)
+        self.map_table.blockSignals(True); self.map_table.setRowCount(len(rows))
+        selected_row = -1
+        for row, record in enumerate(rows):
+            data = record["data"]; map_id = str(data.get("id", "")); encounters = self.map_encounters(map_id); pools = self.map_pool_weathers(map_id)
+            encounter_label = "" if not encounters else (self.encounter_display(encounters[0]) if len(encounters) == 1 else f"{len(encounters)} time records")
+            values = ["*" if record.get("dirty") else "", map_id, str(data.get("name", "")), str(data.get("weather", "")), encounter_label, str(len(pools))]
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(value); item.setData(Qt.ItemDataRole.UserRole, record); self.map_table.setItem(row, column, item)
+            if map_id == current_id:
+                selected_row = row
+        self.map_table.blockSignals(False)
+        if selected_row >= 0:
+            self.map_table.selectRow(selected_row)
+        elif rows:
+            self.map_table.selectRow(0)
+        else:
+            self.current_map = None; self.current_encounter = None; self.summary.setText("No maps matched."); self.refresh_encounter_combo()
+
+    def select_map(self) -> None:
+        selected = self.map_table.selectedItems()
+        if not selected:
+            return
+        self.current_map = selected[0].data(Qt.ItemDataRole.UserRole)
+        data = self.current_map["data"] if self.current_map else {}
+        map_id = str(data.get("id", "")) if isinstance(data, dict) else ""
+        name = str(data.get("name", "")) if isinstance(data, dict) else ""
+        self.summary.setText(f"{map_id}  {name}")
+        self.loading = True; self.set_combo(self.map_weather, str(data.get("weather", "WEATHER_NONE")) if isinstance(data, dict) else "WEATHER_NONE"); self.loading = False
+        self.refresh_encounter_combo()
+
+    def map_weather_changed(self) -> None:
+        if self.loading or not self.current_map:
+            return
+        data = self.current_map["data"]
+        if not isinstance(data, dict):
+            return
+        weather = self.combo_value(self.map_weather)
+        if weather and data.get("weather") != weather:
+            data["weather"] = weather; self.current_map["dirty"] = True; self.window.status(f"Pending map weather change: {data.get('id')} -> {weather}"); self.refresh_maps()
+
+    def refresh_encounter_combo(self, select_encounter: dict[str, object] | None = None) -> None:
+        previous = select_encounter or self.current_encounter
+        map_id = str(self.current_map["data"].get("id", "")) if self.current_map and isinstance(self.current_map.get("data"), dict) else ""
+        records = self.map_encounters(map_id)
+        self.encounter_select.blockSignals(True); self.encounter_select.clear()
+        selected_index = 0
+        for index, encounter in enumerate(records):
+            self.encounter_select.addItem(self.encounter_display(encounter), encounter)
+            if encounter is previous:
+                selected_index = index
+        self.encounter_select.setCurrentIndex(selected_index if records else -1); self.encounter_select.blockSignals(False)
+        self.select_encounter()
+
+    def select_encounter(self) -> None:
+        data = self.encounter_select.currentData()
+        self.current_encounter = data if isinstance(data, dict) else None
+        if self.current_encounter:
+            _shared, time = self.encounter_time_info(self.current_encounter); self.set_combo(self.time_add, time)
+        self.refresh_pool_select()
+
+    def refresh_pool_select(self, select_weather: str | None = None) -> None:
+        previous = select_weather if select_weather is not None else self.pool_select.currentData()
+        self.pool_select.blockSignals(True); self.pool_select.clear(); self.pool_select.addItem("Normal encounters", None)
+        weather_data = self.current_encounter.get("weather_encounters", {}) if self.current_encounter else {}
+        weather_keys = sorted(weather_data.keys(), key=lambda name: self.weather_values.get(str(name), 9999)) if isinstance(weather_data, dict) else []
+        selected_index = 0
+        for index, weather in enumerate(weather_keys, start=1):
+            self.pool_select.addItem(str(weather), str(weather))
+            if weather == previous:
+                selected_index = index
+        self.pool_select.setCurrentIndex(selected_index); self.pool_select.blockSignals(False); self.select_pool()
+
+    def select_pool(self) -> None:
+        self.refresh_area_table()
+
+    def select_area(self) -> None:
+        self.refresh_area_table()
+
+    def current_pool_data(self, create: bool = False) -> dict[str, object] | None:
+        if not self.current_encounter:
+            return None
+        weather = self.pool_select.currentData()
+        if not weather:
+            return self.current_encounter
+        weather_blocks = self.current_encounter.get("weather_encounters")
+        if not isinstance(weather_blocks, dict):
+            if not create:
+                return None
+            weather_blocks = {}; self.current_encounter["weather_encounters"] = weather_blocks
+        if create:
+            return weather_blocks.setdefault(str(weather), {})
+        block = weather_blocks.get(str(weather))
+        return block if isinstance(block, dict) else None
+
+    def area_slot_count(self, area: str) -> int:
+        field = self.field_by_type.get(area, {})
+        rates = field.get("encounter_rates", []) if isinstance(field, dict) else []
+        return len(rates) if isinstance(rates, list) else 0
+
+    def blank_area(self, area: str) -> dict[str, object]:
+        count = self.area_slot_count(area)
+        return {"encounter_rate": 0, "mons": [{"min_level": 1, "max_level": 1, "species": "SPECIES_NONE"} for _index in range(count)]}
+
+    def ensure_area_entry(self) -> dict[str, object] | None:
+        pool = self.current_pool_data(create=True)
+        area = self.combo_value(self.area_select)
+        if pool is None or not area:
+            return None
+        entry = pool.get(area)
+        if not isinstance(entry, dict):
+            entry = self.blank_area(area); pool[area] = entry
+        return entry
+
+    def refresh_area_table(self) -> None:
+        area = self.combo_value(self.area_select)
+        pool = self.current_pool_data(create=False)
+        entry = pool.get(area) if isinstance(pool, dict) and area else None
+        if not isinstance(entry, dict):
+            self.loading = True; self.encounter_rate.setValue(0); self.loading = False; self.mons_table.setRowCount(0); return
+        self.loading = True; self.encounter_rate.setValue(int(entry.get("encounter_rate", 0))); self.loading = False
+        mons = entry.get("mons", [])
+        if not isinstance(mons, list):
+            mons = []
+        field = self.field_by_type.get(area, {})
+        rates = field.get("encounter_rates", []) if isinstance(field, dict) else []
+        self.mons_table.blockSignals(True); self.mons_table.setRowCount(len(mons))
+        for row, mon in enumerate(mons):
+            species = str(mon.get("species", "SPECIES_NONE")) if isinstance(mon, dict) else "SPECIES_NONE"
+            min_level = str(mon.get("min_level", 1)) if isinstance(mon, dict) else "1"
+            max_level = str(mon.get("max_level", 1)) if isinstance(mon, dict) else "1"
+            chance = str(rates[row]) if isinstance(rates, list) and row < len(rates) else ""
+            values = [str(row), chance, min_level, max_level, self.species_label(species)]
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(value); item.setData(Qt.ItemDataRole.UserRole, mon); self.mons_table.setItem(row, column, item)
+        self.mons_table.blockSignals(False)
+        if mons:
+            self.mons_table.selectRow(0)
+
+    def species_label(self, species: str) -> str:
+        name = self.species_names.get(species, "")
+        return f"{name} [{species}]" if name else species
+
+    def refresh_species_combo(self) -> None:
+        current = self.combo_value(self.slot_species) if hasattr(self, "slot_species") else "SPECIES_NONE"
+        query = self.species_filter.text().casefold() if hasattr(self, "species_filter") else ""
+        rows = sorted(self.species_values.items(), key=lambda item: item[1])
+        self.slot_species.blockSignals(True); self.slot_species.clear()
+        added: set[str] = set()
+        for species, _value in rows:
+            name = self.species_names.get(species, "")
+            if query and query not in (species + " " + name).casefold():
+                continue
+            self.slot_species.addItem(self.species_label(species), species); added.add(species)
+        if current and current not in added:
+            self.slot_species.insertItem(0, self.species_label(current), current)
+        self.set_combo(self.slot_species, current or "SPECIES_NONE"); self.slot_species.blockSignals(False)
+
+    def select_mon_slot(self) -> None:
+        selected = self.mons_table.selectedItems()
+        if not selected:
+            return
+        area = self.combo_value(self.area_select); pool = self.current_pool_data(False)
+        entry = pool.get(area) if isinstance(pool, dict) else None
+        mons = entry.get("mons", []) if isinstance(entry, dict) else []
+        row = selected[0].row()
+        if row >= len(mons) or not isinstance(mons[row], dict):
+            return
+        mon = mons[row]; self.loading = True
+        self.slot_min.setValue(int(mon.get("min_level", 1))); self.slot_max.setValue(int(mon.get("max_level", 1))); self.set_species_combo(str(mon.get("species", "SPECIES_NONE")))
+        self.loading = False
+
+    def mark_wild_dirty(self, message: str = "Pending wild encounter change") -> None:
+        self.encounter_dirty = True; self.window.status(message)
+
+    def area_rate_changed(self) -> None:
+        if self.loading or not self.current_encounter:
+            return
+        entry = self.ensure_area_entry()
+        if entry is None:
+            return
+        entry["encounter_rate"] = self.encounter_rate.value(); self.mark_wild_dirty("Pending encounter rate change")
+
+    def apply_slot(self) -> None:
+        selected = self.mons_table.selectedItems()
+        if not selected:
+            self.window.status("Select an encounter slot first"); return
+        row = selected[0].row(); entry = self.ensure_area_entry()
+        if entry is None:
+            return
+        mons = entry.setdefault("mons", [])
+        while len(mons) <= row:
+            mons.append({"min_level": 1, "max_level": 1, "species": "SPECIES_NONE"})
+        min_level = self.slot_min.value(); max_level = max(min_level, self.slot_max.value())
+        mons[row] = {"min_level": min_level, "max_level": max_level, "species": self.combo_value(self.slot_species) or "SPECIES_NONE"}
+        self.mark_wild_dirty("Pending encounter slot change"); self.refresh_area_table(); self.mons_table.selectRow(row)
+
+    def add_weather_pool(self) -> None:
+        if not self.current_encounter:
+            return
+        weather = self.combo_value(self.add_weather)
+        if not weather:
+            return
+        weather_blocks = self.current_encounter.setdefault("weather_encounters", {})
+        if not isinstance(weather_blocks, dict):
+            weather_blocks = {}; self.current_encounter["weather_encounters"] = weather_blocks
+        if weather not in weather_blocks:
+            weather_blocks[weather] = {}; self.mark_wild_dirty(f"Added weather pool: {weather}")
+        self.refresh_pool_select(weather); self.refresh_maps()
+
+    def delete_weather_pool(self) -> None:
+        if not self.current_encounter:
+            return
+        weather = self.pool_select.currentData()
+        if not weather:
+            self.window.status("Normal encounters cannot be deleted here"); return
+        weather_blocks = self.current_encounter.get("weather_encounters", {})
+        if isinstance(weather_blocks, dict) and weather in weather_blocks:
+            del weather_blocks[weather]
+            if not weather_blocks:
+                self.current_encounter.pop("weather_encounters", None)
+            self.mark_wild_dirty(f"Deleted weather pool: {weather}"); self.refresh_pool_select(); self.refresh_maps()
+
+    def copy_or_create_area(self) -> None:
+        if not self.current_encounter:
+            return
+        area = self.combo_value(self.area_select)
+        if not area:
+            return
+        weather = self.pool_select.currentData()
+        pool = self.current_pool_data(create=True)
+        if pool is None:
+            return
+        if not weather and area in pool:
+            self.window.status("Normal encounter area already exists; select a weather pool to copy it."); return
+        if weather and isinstance(self.current_encounter.get(area), dict):
+            pool[area] = copy.deepcopy(self.current_encounter[area])
+        else:
+            pool[area] = self.blank_area(area)
+        self.mark_wild_dirty(f"Created encounter area: {area}"); self.refresh_area_table()
+
+    def delete_weather_area(self) -> None:
+        weather = self.pool_select.currentData()
+        if not weather:
+            self.window.status("Select a weather pool before deleting an area"); return
+        pool = self.current_pool_data(create=False); area = self.combo_value(self.area_select)
+        if isinstance(pool, dict) and area in pool:
+            del pool[area]; self.mark_wild_dirty(f"Deleted weather area: {area}"); self.refresh_area_table()
+
+    def add_time_variant(self) -> None:
+        if not self.current_encounter or not self.wild_group:
+            return
+        target_time = self.combo_value(self.time_add)
+        shared, _current_time = self.encounter_time_info(self.current_encounter)
+        target_label = shared if target_time == self.time_fallback else f"{shared}_{self.time_labels.get(target_time, target_time)}"
+        map_id = str(self.current_encounter.get("map", ""))
+        for encounter in self.encounters:
+            if encounter.get("map") == map_id and encounter.get("base_label") == target_label:
+                self.refresh_encounter_combo(encounter); self.window.status(f"Time variant already exists: {target_label}"); return
+        new_encounter = copy.deepcopy(self.current_encounter); new_encounter["base_label"] = target_label
+        insert_at = len(self.encounters)
+        for index, encounter in enumerate(self.encounters):
+            if encounter is self.current_encounter:
+                insert_at = index + 1; break
+        self.encounters.insert(insert_at, new_encounter)
+        self.wild_group["encounters"] = self.encounters
+        self.rebuild_encounter_index(); self.mark_wild_dirty(f"Added time variant: {target_label}"); self.refresh_maps(); self.refresh_encounter_combo(new_encounter)
+
+    def pending_map_records(self) -> list[dict[str, object]]:
+        return [record for record in self.map_records if record.get("dirty")]
+
+    def has_changes(self) -> bool:
+        return self.encounter_dirty or bool(self.pending_map_records())
+
+    def show_diff(self) -> None:
+        chunks: list[str] = []
+        for record in self.pending_map_records():
+            path = record["path"]; before = str(record["original"]); after = dump_json(record["data"])
+            diff = difflib.unified_diff(before.splitlines(), after.splitlines(), fromfile=rel(self.window.root, path), tofile=rel(self.window.root, path) + " pending", lineterm="")
+            chunks.append("\n".join(diff))
+        if self.encounter_dirty:
+            after = dump_json(self.encounter_data)
+            diff = difflib.unified_diff(self.encounter_original.splitlines(), after.splitlines(), fromfile=rel(self.window.root, self.encounter_path), tofile=rel(self.window.root, self.encounter_path) + " pending", lineterm="")
+            chunks.append("\n".join(diff))
+        dialog = QDialog(self); dialog.setWindowTitle("Diff: maps / encounters"); dialog.resize(1100, 720)
+        layout = QVBoxLayout(dialog); text = QPlainTextEdit(); text.setReadOnly(True); text.setPlainText("\n\n".join(chunk for chunk in chunks if chunk) or "No changes."); layout.addWidget(text)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close); buttons.rejected.connect(dialog.reject); layout.addWidget(buttons); dialog.exec()
+
+    def save(self) -> None:
+        dirty_maps = self.pending_map_records()
+        saved_encounters = self.encounter_dirty
+        if not dirty_maps and not saved_encounters:
+            self.window.status("No pending map or encounter changes"); return
+        try:
+            for record in dirty_maps:
+                path = record["path"]; original = str(record["original"])
+                if read_utf8(path) != original:
+                    raise RuntimeError(f"{rel(self.window.root, path)} changed on disk; reload before saving.")
+                after = dump_json(record["data"]); write_with_backup(path, after); record["original"] = after; record["dirty"] = False
+            if saved_encounters:
+                if read_utf8(self.encounter_path) != self.encounter_original:
+                    raise RuntimeError(f"{rel(self.window.root, self.encounter_path)} changed on disk; reload before saving.")
+                after = dump_json(self.encounter_data); write_with_backup(self.encounter_path, after); self.encounter_original = after; self.encounter_dirty = False
+        except (OSError, RuntimeError) as error:
+            QMessageBox.critical(self, "Save failed", str(error)); return
+        suffix = "wild encounters" if saved_encounters else "map weather only"
+        self.refresh_maps(); self.window.status(f"Saved {len(dirty_maps)} map file(s) and {suffix} with backups")
+
+
 @dataclass
 class MoveMetadata:
     type: str
@@ -5728,8 +6257,8 @@ class Workbench(QMainWindow):
         super().__init__(); self.settings = QSettings("PokemonDecompTools", "ExpansionStudio"); self.lang = self.settings.value("ui/language", "ja"); self.root = Path(self.settings.value("repo/root", str(Path.cwd()))); self.tool_dir = writable_tool_dir(); self.process: QProcess | None = None; self.command_log: QDialog | None = None
         self.loaded_panels: set[str] = set(); self.loading_depth = 0; self.auto_terminal_key = ""
         self.setStatusBar(QStatusBar()); self.make_toolbar(); self.loading_label = QLabel("読み込み中..."); self.loading_label.setVisible(False); self.statusBar().addPermanentWidget(self.loading_label); self.tabs = QTabWidget(); self.setCentralWidget(self.tabs)
-        self.translation = TranslationPanel(self); self.constants = ConstantsPanel(self); self.files = FileSearchPanel(self); self.index = CodeIndexPanel(self); self.rom_layout = RomLayoutPanel(self); self.species = PokemonStudioPanel(self); self.moves = MoveStudioPanel(self); self.frontier = BattleFrontierPanel(self); self.assets = AssetPanel(self); self.dependencies = DependencyPanel(self); self.fonts = FontPanel(self); self.poryscript = PoryscriptPanel(self); self.tool_settings = SettingsPanel(self)
-        self.panels: list[tuple[str, QWidget, Callable[[], None] | None]] = [("translation", self.translation, self.translation.load), ("constants", self.constants, self.constants.load), ("files", self.files, None), ("index", self.index, self.index.load), ("rom_layout", self.rom_layout, self.rom_layout.load), ("species", self.species, self.species.load), ("moves", self.moves, self.moves.load), ("frontier", self.frontier, self.frontier.load), ("assets", self.assets, self.assets.load), ("dependencies", self.dependencies, None), ("fonts", self.fonts, self.fonts.load), ("poryscript", self.poryscript, self.poryscript.load), ("settings", self.tool_settings, self.tool_settings.load)]
+        self.translation = TranslationPanel(self); self.constants = ConstantsPanel(self); self.files = FileSearchPanel(self); self.index = CodeIndexPanel(self); self.rom_layout = RomLayoutPanel(self); self.species = PokemonStudioPanel(self); self.moves = MoveStudioPanel(self); self.maps = MapEncounterPanel(self); self.frontier = BattleFrontierPanel(self); self.assets = AssetPanel(self); self.dependencies = DependencyPanel(self); self.fonts = FontPanel(self); self.poryscript = PoryscriptPanel(self); self.tool_settings = SettingsPanel(self)
+        self.panels: list[tuple[str, QWidget, Callable[[], None] | None]] = [("translation", self.translation, self.translation.load), ("constants", self.constants, self.constants.load), ("files", self.files, None), ("index", self.index, self.index.load), ("rom_layout", self.rom_layout, self.rom_layout.load), ("species", self.species, self.species.load), ("moves", self.moves, self.moves.load), ("maps", self.maps, self.maps.load), ("frontier", self.frontier, self.frontier.load), ("assets", self.assets, self.assets.load), ("dependencies", self.dependencies, None), ("fonts", self.fonts, self.fonts.load), ("poryscript", self.poryscript, self.poryscript.load), ("settings", self.tool_settings, self.tool_settings.load)]
         for key, panel, _loader in self.panels: self.tabs.addTab(panel, tr(key, self.lang))
         self.tabs.currentChanged.connect(lambda _index: self.load_current())
         self.retranslate(); self.apply_readability_style(); self.resize(1580, 960)

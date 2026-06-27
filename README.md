@@ -208,6 +208,25 @@ Displayed information includes:
 
 Move lists can be filtered by type and category.
 
+### ROM Layout
+
+The ROM Layout workspace connects build outputs back to source-level symbols.
+
+It reads `pokeemerald.map` and `pokeemerald.gba` from the project root, then displays where symbols are placed in the compiled ROM.
+
+Features:
+
+- Automatic detection of `pokeemerald.map`, `pokeemerald.gba`, and `pokeemerald.elf`
+- Symbol name, GBA address, ROM offset, estimated size, section, and object file display
+- Hex preview for symbols located inside the ROM file
+- Safe handling for RAM symbols such as `0x02000000` / `0x03000000`
+- Warning when `.map` and `.gba` timestamps appear to come from different builds
+- Related source candidate display
+- Jump to definition
+- Copy symbol name, GBA address, and ROM offset
+
+This is a read-only inspection feature. It does not decompile ROMs and does not edit ROM files.
+
 ### Assets
 
 The Assets workspace helps browse, add, and replace graphics-related files.

@@ -111,6 +111,8 @@ LANG = {
     },
 }
 LANG["ja"]["index"] = "インデックス"
+LANG["ja"]["rom_layout"] = "ROM Layout"
+LANG["en"]["rom_layout"] = "ROM Layout"
 
 
 def tr(key: str, lang: str) -> str:
@@ -2434,6 +2436,323 @@ class CodeIndexPanel(QWidget):
         self.window.files.search()
 
 
+ROM_ADDRESS_BASE = 0x08000000
+MAP_TOP_SECTION_RE = re.compile(r"^(\.[A-Za-z0-9_.$]+)\s+0x([0-9A-Fa-f]+)\s+0x([0-9A-Fa-f]+)")
+MAP_INPUT_SECTION_RE = re.compile(r"^\s+(\.[A-Za-z0-9_.$]+)\s+0x([0-9A-Fa-f]+)\s+0x([0-9A-Fa-f]+)\s+(.+?)\s*$")
+MAP_SYMBOL_RE = re.compile(r"^\s+0x([0-9A-Fa-f]+)\s+([A-Za-z_][A-Za-z0-9_$@.]*)\s*$")
+
+
+@dataclass
+class RomMapSymbol:
+    name: str
+    address: int
+    section: str
+    object_file: str
+    estimated_size: int | None = None
+
+    @property
+    def rom_offset(self) -> int | None:
+        return self.address - ROM_ADDRESS_BASE if self.address >= ROM_ADDRESS_BASE else None
+
+    @property
+    def search_text(self) -> str:
+        return " ".join((self.name, self.section, self.object_file, f"{self.address:08X}")).casefold()
+
+
+def sanitize_map_object_path(value: str) -> str:
+    value = value.strip().replace("\\", "/")
+    if not value:
+        return ""
+    archive_suffix = ""
+    if "(" in value and value.endswith(")"):
+        value, archive_suffix = value.split("(", 1)
+        archive_suffix = "(" + archive_suffix
+    if re.match(r"^[A-Za-z]:/", value) or value.startswith("/"):
+        parts = [part for part in value.split("/") if part]
+        value = ".../" + "/".join(parts[-2:]) if len(parts) >= 2 else Path(value).name
+    return value + archive_suffix
+
+
+def parse_build_map(map_path: Path) -> list[RomMapSymbol]:
+    symbols: list[RomMapSymbol] = []
+    current_section = ""
+    current_object = ""
+    in_memory_map = False
+    with map_path.open("r", encoding="utf-8", errors="replace") as handle:
+        for raw_line in handle:
+            line = raw_line.rstrip("\n")
+            if line.strip() == "Linker script and memory map":
+                in_memory_map = True
+                continue
+            if not in_memory_map:
+                continue
+            top_match = MAP_TOP_SECTION_RE.match(line)
+            if top_match and not raw_line[:1].isspace():
+                current_section = top_match.group(1)
+                current_object = ""
+                continue
+            input_match = MAP_INPUT_SECTION_RE.match(line)
+            if input_match:
+                tail = input_match.group(4).strip()
+                if ".o" in tail or ".a" in tail:
+                    current_object = sanitize_map_object_path(tail)
+                continue
+            symbol_match = MAP_SYMBOL_RE.match(line)
+            if not symbol_match:
+                continue
+            name = symbol_match.group(2)
+            if name.startswith(".") or "=" in name:
+                continue
+            symbols.append(RomMapSymbol(name, int(symbol_match.group(1), 16), current_section, current_object))
+    by_section: dict[str, list[RomMapSymbol]] = {}
+    for symbol in symbols:
+        by_section.setdefault(symbol.section, []).append(symbol)
+    for section_symbols in by_section.values():
+        section_symbols.sort(key=lambda item: (item.address, item.name))
+        next_addresses = sorted({item.address for item in section_symbols})
+        for symbol in section_symbols:
+            next_address = next((address for address in next_addresses if address > symbol.address), None)
+            if next_address is not None:
+                symbol.estimated_size = next_address - symbol.address
+    return sorted(symbols, key=lambda item: (item.address, item.section, item.name))
+
+
+class RomLayoutPanel(QWidget):
+    def __init__(self, window: "Workbench") -> None:
+        super().__init__(); self.window = window; self.symbols: list[RomMapSymbol] = []; self.current: RomMapSymbol | None = None; self.map_path: Path | None = None; self.gba_path: Path | None = None; self.elf_path: Path | None = None; self.source_cache: dict[str, list[CodeIndexEntry]] = {}
+        layout = QVBoxLayout(self)
+        files = QHBoxLayout(); self.map_edit = QLineEdit(); self.map_edit.setReadOnly(True); self.map_edit.setPlaceholderText("pokeemerald.map"); self.gba_edit = QLineEdit(); self.gba_edit.setReadOnly(True); self.gba_edit.setPlaceholderText("pokeemerald.gba"); self.elf_label = QLabel("ELF: -"); self.map_button = QPushButton("Select map"); self.map_button.clicked.connect(self.choose_map); self.gba_button = QPushButton("Select gba"); self.gba_button.clicked.connect(self.choose_gba); self.reload_button = QPushButton("Reload"); self.reload_button.clicked.connect(lambda: self.load(force=True))
+        files.addWidget(QLabel("map path")); files.addWidget(self.map_edit, 2); files.addWidget(self.map_button); files.addWidget(QLabel("gba path")); files.addWidget(self.gba_edit, 2); files.addWidget(self.gba_button); files.addWidget(self.elf_label); files.addWidget(self.reload_button); layout.addLayout(files)
+        filters = QHBoxLayout(); self.query = QLineEdit(); self.query.setPlaceholderText("symbol search"); self.query.textChanged.connect(self.refresh); self.section_filter = QLineEdit(); self.section_filter.setPlaceholderText("section filter"); self.section_filter.textChanged.connect(self.refresh); self.object_filter = QLineEdit(); self.object_filter.setPlaceholderText("object file filter"); self.object_filter.textChanged.connect(self.refresh); self.rom_only = QCheckBox("ROM symbols only"); self.rom_only.setChecked(True); self.rom_only.stateChanged.connect(self.refresh)
+        filters.addWidget(self.query, 2); filters.addWidget(self.section_filter); filters.addWidget(self.object_filter); filters.addWidget(self.rom_only); layout.addLayout(filters)
+        self.warning = QLabel(); self.warning.setWordWrap(True); layout.addWidget(self.warning)
+        split = QSplitter(Qt.Orientation.Horizontal); self.table = QTableWidget(0, 6); self.table.setHorizontalHeaderLabels(["Symbol", "GBA Address", "ROM Offset", "Estimated Size", "Section", "Object File"]); self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows); self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers); self.table.itemSelectionChanged.connect(self.select_symbol); split.addWidget(self.table)
+        detail = QWidget(); detail_layout = QVBoxLayout(detail); self.detail = QLabel("Select a ROM symbol."); self.detail.setWordWrap(True); detail_layout.addWidget(self.detail); detail_layout.addWidget(QLabel("Hex preview")); self.hex_preview = QPlainTextEdit(); self.hex_preview.setReadOnly(True); detail_layout.addWidget(self.hex_preview); detail_layout.addWidget(QLabel("Related source candidates")); self.sources = QListWidget(); self.sources.itemDoubleClicked.connect(lambda _item: self.jump_to_definition()); detail_layout.addWidget(self.sources)
+        buttons = QHBoxLayout(); self.copy_name_button = QPushButton("Copy name"); self.copy_name_button.clicked.connect(self.copy_name); self.copy_address_button = QPushButton("Copy GBA address"); self.copy_address_button.clicked.connect(self.copy_address); self.copy_offset_button = QPushButton("Copy ROM offset"); self.copy_offset_button.clicked.connect(self.copy_offset); self.jump_button = QPushButton("Jump to definition"); self.jump_button.clicked.connect(self.jump_to_definition)
+        for button in (self.copy_name_button, self.copy_address_button, self.copy_offset_button, self.jump_button): buttons.addWidget(button)
+        detail_layout.addLayout(buttons); split.addWidget(detail); stabilize_splitter(split, 2, 1); split.setSizes([980, 560]); layout.addWidget(split)
+
+    def display_path(self, path: Path | None) -> str:
+        if not path:
+            return ""
+        try:
+            return path.relative_to(self.window.root).as_posix()
+        except ValueError:
+            return path.name
+
+    def reset_loaded(self) -> None:
+        self.symbols.clear()
+        self.current = None
+        self.map_path = None
+        self.gba_path = None
+        self.elf_path = None
+        self.source_cache.clear()
+        self.map_edit.clear()
+        self.gba_edit.clear()
+        self.elf_label.setText("ELF: -")
+        self.warning.clear()
+        self.hex_preview.clear()
+        self.sources.clear()
+        self.table.setRowCount(0)
+
+    def detect_paths(self) -> None:
+        root = self.window.root
+        if self.map_path is None:
+            path = root / "pokeemerald.map"
+            self.map_path = path if path.exists() else None
+        if self.gba_path is None:
+            path = root / "pokeemerald.gba"
+            self.gba_path = path if path.exists() else None
+        path = root / "pokeemerald.elf"
+        self.elf_path = path if path.exists() else None
+        self.map_edit.setText(self.display_path(self.map_path)); self.gba_edit.setText(self.display_path(self.gba_path)); self.elf_label.setText(f"ELF: {self.display_path(self.elf_path) or '-'}")
+
+    def choose_map(self) -> None:
+        selected, _ = QFileDialog.getOpenFileName(self, "Select map file", str(self.window.root), "Map files (*.map);;All files (*)")
+        if selected:
+            self.map_path = Path(selected)
+            self.load(force=True)
+
+    def choose_gba(self) -> None:
+        selected, _ = QFileDialog.getOpenFileName(self, "Select GBA file", str(self.window.root), "GBA files (*.gba);;All files (*)")
+        if selected:
+            self.gba_path = Path(selected)
+            self.load(force=True)
+
+    def load(self, force: bool = False) -> None:
+        if not self.window.root_valid():
+            return
+        if force:
+            self.symbols.clear(); self.current = None; self.source_cache.clear()
+        self.detect_paths()
+        self.window.begin_loading("Loading ROM layout...")
+        try:
+            if not self.map_path or not self.map_path.exists():
+                self.symbols = []; self.warning.setText("pokeemerald.map was not found. Select a .map file to load symbols."); self.refresh(); return
+            self.symbols = parse_build_map(self.map_path)
+            self.warning.setText(self.build_warning())
+            self.ensure_index_loaded()
+            self.refresh()
+            self.window.status(f"Loaded {len(self.symbols)} ROM layout symbols")
+        finally:
+            self.window.end_loading()
+
+    def build_warning(self) -> str:
+        notes: list[str] = []
+        if not self.gba_path or not self.gba_path.exists():
+            notes.append("pokeemerald.gba was not found. Hex preview is unavailable until a .gba file is selected.")
+        if self.map_path and self.gba_path and self.map_path.exists() and self.gba_path.exists():
+            delta = abs(self.map_path.stat().st_mtime - self.gba_path.stat().st_mtime)
+            if delta > 120:
+                notes.append("Warning: .map and .gba timestamps differ by more than 2 minutes. They may be from different builds.")
+        return " ".join(notes)
+
+    def ensure_index_loaded(self) -> None:
+        if self.window.index.entries:
+            return
+        cached = load_code_index_cache(self.window.root)
+        self.window.index.entries = cached if cached is not None else build_code_index(self.window.root)
+        if cached is None:
+            save_code_index_cache(self.window.root, self.window.index.entries)
+        self.window.index.rebuild_name_index()
+
+    def filtered(self) -> list[RomMapSymbol]:
+        query = self.query.text().casefold().strip(); section = self.section_filter.text().casefold().strip(); obj = self.object_filter.text().casefold().strip()
+        rows: list[RomMapSymbol] = []
+        gba_size = self.gba_path.stat().st_size if self.gba_path and self.gba_path.exists() else None
+        for symbol in self.symbols:
+            offset = symbol.rom_offset
+            if self.rom_only.isChecked() and (offset is None or (gba_size is not None and offset >= gba_size)):
+                continue
+            if query and query not in symbol.search_text:
+                continue
+            if section and section not in symbol.section.casefold():
+                continue
+            if obj and obj not in symbol.object_file.casefold():
+                continue
+            rows.append(symbol)
+        return rows
+
+    @staticmethod
+    def hex_value(value: int | None) -> str:
+        return "-" if value is None else f"0x{value:X}"
+
+    def refresh(self) -> None:
+        rows = self.filtered(); self.table.setRowCount(len(rows))
+        for row, symbol in enumerate(rows):
+            values = [symbol.name, f"0x{symbol.address:08X}", self.hex_value(symbol.rom_offset), self.hex_value(symbol.estimated_size), symbol.section, symbol.object_file]
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(value); item.setData(Qt.ItemDataRole.UserRole, symbol); self.table.setItem(row, column, item)
+        self.window.status(f"{len(rows)} / {len(self.symbols)} ROM layout symbols")
+
+    def select_symbol(self) -> None:
+        selected = self.table.selectedItems()
+        if not selected:
+            return
+        self.current = selected[0].data(Qt.ItemDataRole.UserRole)
+        symbol = self.current
+        self.detail.setText(f"{symbol.name}\nGBA address: 0x{symbol.address:08X}\nROM offset: {self.hex_value(symbol.rom_offset)}\nSize: {self.hex_value(symbol.estimated_size)} estimated\nSection: {symbol.section}\nObject: {symbol.object_file}")
+        self.show_hex_preview(symbol)
+        self.show_source_candidates(symbol.name)
+
+    def show_hex_preview(self, symbol: RomMapSymbol) -> None:
+        offset = symbol.rom_offset
+        if offset is None:
+            self.hex_preview.setPlainText("No ROM offset for this symbol.")
+            return
+        if not self.gba_path or not self.gba_path.exists():
+            self.hex_preview.setPlainText("No .gba file selected.")
+            return
+        size = self.gba_path.stat().st_size
+        if offset < 0 or offset >= size:
+            self.hex_preview.setPlainText("ROM offset is outside the selected .gba file.")
+            return
+        read_size = min(256, max(64, symbol.estimated_size or 64), size - offset)
+        with self.gba_path.open("rb") as handle:
+            handle.seek(offset)
+            data = handle.read(read_size)
+        lines = []
+        for base in range(0, len(data), 16):
+            chunk = data[base:base + 16]
+            hex_part = " ".join(f"{byte:02X}" for byte in chunk)
+            ascii_part = "".join(chr(byte) if 32 <= byte < 127 else "." for byte in chunk)
+            lines.append(f"{offset + base:08X}  {hex_part:<47}  {ascii_part}")
+        self.hex_preview.setPlainText("\n".join(lines))
+
+    def exact_source_search(self, name: str) -> list[CodeIndexEntry]:
+        if name in self.source_cache:
+            return self.source_cache[name]
+        pattern = re.compile(rf"\b{re.escape(name)}\b")
+        found: list[CodeIndexEntry] = []
+        for path in code_index_paths(self.window.root):
+            try:
+                lines = read_utf8(path).splitlines()
+            except UnicodeDecodeError:
+                continue
+            for number, line in enumerate(lines, 1):
+                if pattern.search(line):
+                    file_name = rel(self.window.root, path)
+                    found.append(make_code_index_entry("source", name, "", file_name, number, line))
+                    break
+            if len(found) >= 25:
+                break
+        self.source_cache[name] = found
+        return found
+
+    def source_candidates(self, name: str) -> list[CodeIndexEntry]:
+        self.ensure_index_loaded()
+        exact = self.window.index.name_index.get(name, [])
+        if exact:
+            return exact
+        fallback = self.exact_source_search(name)
+        if fallback:
+            return fallback
+        return self.window.index.definition_candidates(name)[:25]
+
+    def show_source_candidates(self, name: str) -> None:
+        self.sources.clear()
+        for entry in self.source_candidates(name):
+            item = QListWidgetItem(f"{entry.kind} | {entry.file}:{entry.line} | {entry.preview[:160]}")
+            item.setData(Qt.ItemDataRole.UserRole, entry)
+            self.sources.addItem(item)
+        if self.sources.count() == 0:
+            self.sources.addItem("No related source candidate found.")
+
+    def selected_source_entry(self) -> CodeIndexEntry | None:
+        item = self.sources.currentItem()
+        if item:
+            entry = item.data(Qt.ItemDataRole.UserRole)
+            if isinstance(entry, CodeIndexEntry):
+                return entry
+        if self.sources.count() > 0:
+            entry = self.sources.item(0).data(Qt.ItemDataRole.UserRole)
+            if isinstance(entry, CodeIndexEntry):
+                return entry
+        return None
+
+    def jump_to_definition(self) -> None:
+        entry = self.selected_source_entry()
+        if not entry:
+            self.window.status("No source candidate selected")
+            return
+        self.window.tabs.setCurrentWidget(self.window.index)
+        if not self.window.index.entries:
+            self.ensure_index_loaded()
+        self.window.index.show_entry(entry)
+
+    def copy_name(self) -> None:
+        if self.current:
+            QApplication.clipboard().setText(self.current.name); self.window.status(self.current.name)
+
+    def copy_address(self) -> None:
+        if self.current:
+            text = f"0x{self.current.address:08X}"; QApplication.clipboard().setText(text); self.window.status(text)
+
+    def copy_offset(self) -> None:
+        if self.current:
+            text = self.hex_value(self.current.rom_offset); QApplication.clipboard().setText(text); self.window.status(text)
+
+
 @dataclass
 class AssetGroup:
     key: str
@@ -4271,6 +4590,17 @@ class GeneralTrainerBlock:
 
 
 @dataclass
+class TrainerPartyMonBlock:
+    index: int
+    start: int
+    end: int
+    raw: str
+    species: str
+    level: str
+    item: str
+
+
+@dataclass
 class MoveMetadata:
     type: str
     category: str
@@ -4339,7 +4669,7 @@ class BattleFrontierPanel(QWidget):
         gimmick = QWidget(); gimmick_form = QFormLayout(gimmick); self.mon_tera = self.combo(); self.mon_dmax = QCheckBox("Use Dynamax"); self.mon_dmax_level = self.spin(0, 10); self.mon_gmax = QCheckBox("Gigantamax factor"); self.mon_shiny = QCheckBox("Shiny"); self.mon_tags = QLineEdit()
         for label, control in (("Tera type", self.mon_tera), ("Dynamax", self.mon_dmax), ("Dynamax level", self.mon_dmax_level), ("Gigantamax", self.mon_gmax), ("Shiny", self.mon_shiny), ("Tags", self.mon_tags)): gimmick_form.addRow(label, control)
         form_tabs.addTab(gimmick, "Gimmick")
-        right_layout.addWidget(form_tabs); buttons = QHBoxLayout(); diff = QPushButton("Diff"); diff.clicked.connect(self.show_mon_diff); save = QPushButton("Save pool"); save.clicked.connect(self.save_mons); buttons.addStretch(); buttons.addWidget(diff); buttons.addWidget(save); right_layout.addLayout(buttons); split.addWidget(right); stabilize_splitter(split, 1, 1); split.setSizes([720, 760]); layout.addWidget(split); self.tabs.addTab(page, "Pokemon pool")
+        right_layout.addWidget(form_tabs); buttons = QHBoxLayout(); add = QPushButton("Add"); add.clicked.connect(self.add_frontier_mon); delete = QPushButton("Delete"); delete.clicked.connect(self.delete_frontier_mon); diff = QPushButton("Diff"); diff.clicked.connect(self.show_mon_diff); save = QPushButton("Save pool"); save.clicked.connect(self.save_mons); buttons.addWidget(add); buttons.addWidget(delete); buttons.addStretch(); buttons.addWidget(diff); buttons.addWidget(save); right_layout.addLayout(buttons); split.addWidget(right); stabilize_splitter(split, 1, 1); split.setSizes([720, 760]); layout.addWidget(split); self.tabs.addTab(page, "Pokemon pool")
         self.mon_species.currentIndexChanged.connect(self.refresh_species_dependent_choices)
         self.mon_item_filter.textChanged.connect(self.refresh_item_choices); self.mon_item_category.currentIndexChanged.connect(self.refresh_item_choices)
         for control in [self.mon_species, self.mon_nickname, self.mon_item, self.mon_ability, self.mon_nature, self.mon_ball, self.mon_gender, self.mon_level, self.mon_friendship, self.mon_tera, self.mon_dmax, self.mon_dmax_level, self.mon_gmax, self.mon_shiny, self.mon_tags, *self.mon_moves, *self.ev_boxes, *self.iv_boxes]:
@@ -4361,7 +4691,11 @@ class BattleFrontierPanel(QWidget):
         self.set_columns(self.general_trainer_table, [240, 150, 170, 80, 170])
         right = QWidget(); right.setMinimumWidth(DETAIL_PANEL_MIN_WIDTH); right_layout = QVBoxLayout(right)
         self.general_trainer_label = QLabel("Select a trainer.party block."); self.general_trainer_label.setWordWrap(True); right_layout.addWidget(self.general_trainer_label)
-        self.general_trainer_editor = QPlainTextEdit(); self.general_trainer_editor.textChanged.connect(self.general_trainer_changed); right_layout.addWidget(self.general_trainer_editor)
+        form_box = QGroupBox("Trainer"); form = QFormLayout(form_box); self.general_name_edit = QLineEdit(); self.general_class_edit = QLineEdit(); self.general_name_edit.textChanged.connect(self.general_fields_changed); self.general_class_edit.textChanged.connect(self.general_fields_changed); form.addRow("Name", self.general_name_edit); form.addRow("Class", self.general_class_edit); right_layout.addWidget(form_box)
+        edit_tabs = QTabWidget(); party_page = QWidget(); party_layout = QVBoxLayout(party_page); self.general_party_table = QTableWidget(0, 4); self.general_party_table.setHorizontalHeaderLabels(["No.", "Pokemon", "Level", "Item"]); self.general_party_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows); self.general_party_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers); self.general_party_table.itemSelectionChanged.connect(self.select_general_party_mon); self.set_columns(self.general_party_table, [48, 220, 90, 180]); party_layout.addWidget(self.general_party_table)
+        self.general_party_editor = QPlainTextEdit(); party_layout.addWidget(self.general_party_editor); party_buttons = QHBoxLayout(); add_mon = QPushButton("Add Pokemon"); add_mon.clicked.connect(self.add_general_party_mon); delete_mon = QPushButton("Delete Pokemon"); delete_mon.clicked.connect(self.delete_general_party_mon); apply_mon = QPushButton("Apply Pokemon edit"); apply_mon.clicked.connect(self.apply_general_party_mon); party_buttons.addWidget(add_mon); party_buttons.addWidget(delete_mon); party_buttons.addStretch(); party_buttons.addWidget(apply_mon); party_layout.addLayout(party_buttons); edit_tabs.addTab(party_page, "Pokemon")
+        raw_page = QWidget(); raw_layout = QVBoxLayout(raw_page); self.general_trainer_editor = QPlainTextEdit(); self.general_trainer_editor.textChanged.connect(self.general_trainer_changed); raw_layout.addWidget(self.general_trainer_editor); edit_tabs.addTab(raw_page, "Raw")
+        right_layout.addWidget(edit_tabs)
         buttons = QHBoxLayout(); diff = QPushButton("Trainer.party diff"); diff.clicked.connect(self.show_general_trainer_diff); save = QPushButton("Save trainer.party block"); save.clicked.connect(self.save_general_trainer); buttons.addStretch(); buttons.addWidget(diff); buttons.addWidget(save); right_layout.addLayout(buttons)
         split.addWidget(right); stabilize_splitter(split, 1, 1); split.setSizes([720, 760]); layout.addWidget(split); self.tabs.addTab(page, "General trainers")
 
@@ -4637,16 +4971,62 @@ class BattleFrontierPanel(QWidget):
 
     @staticmethod
     def trainer_party_count(block: str) -> int:
-        body = block.split("\n\n", 1)[1] if "\n\n" in block else ""
-        count = 0
-        for line in body.splitlines():
-            stripped = line.strip()
-            if not stripped or stripped.startswith(("-", "/*", "*")) or ":" in stripped:
-                continue
-            if stripped.startswith("==="):
-                continue
-            count += 1
-        return count
+        return len(BattleFrontierPanel.trainer_party_mon_blocks(block))
+
+    @staticmethod
+    def set_trainer_party_field(block: str, name: str, value: str) -> str:
+        pattern = re.compile(rf"(?m)^({re.escape(name)}:\s*).*$")
+        if pattern.search(block):
+            return pattern.sub(lambda match: match.group(1) + value, block, count=1)
+        header_end = block.find("\n")
+        insert_at = len(block) if header_end < 0 else header_end + 1
+        return block[:insert_at] + f"{name}: {value}\n" + block[insert_at:]
+
+    @staticmethod
+    def trainer_party_body_start(block: str) -> int:
+        match = re.search(r"\r?\n[ \t]*\r?\n", block)
+        return match.end() if match else len(block)
+
+    @staticmethod
+    def trainer_party_mon_blocks(block: str) -> list[TrainerPartyMonBlock]:
+        body_start = BattleFrontierPanel.trainer_party_body_start(block)
+        result: list[TrainerPartyMonBlock] = []
+        pos = body_start
+        index = 0
+        while pos < len(block):
+            while pos < len(block):
+                line_end = block.find("\n", pos)
+                line_end = len(block) if line_end < 0 else line_end + 1
+                if block[pos:line_end].strip():
+                    break
+                pos = line_end
+            if pos >= len(block):
+                break
+            start = pos
+            while pos < len(block):
+                line_end = block.find("\n", pos)
+                line_end = len(block) if line_end < 0 else line_end + 1
+                if not block[pos:line_end].strip():
+                    break
+                pos = line_end
+            end = pos
+            raw = block[start:end].strip("\r\n")
+            first = next((line.strip() for line in raw.splitlines() if line.strip()), "")
+            level = BattleFrontierPanel.trainer_party_field(raw, "Level")
+            item = first.split("@", 1)[1].strip() if "@" in first else ""
+            species = first.split("@", 1)[0].strip()
+            result.append(TrainerPartyMonBlock(index, start, end, raw, species, level, item))
+            index += 1
+        return result
+
+    def set_general_trainer_text(self, text: str, refresh_party: bool = True) -> None:
+        if not self.current_general_trainer:
+            return
+        self.general_trainer_states[self.current_general_trainer.key] = text
+        self.general_trainer_editor.blockSignals(True); self.general_trainer_editor.setPlainText(text); self.general_trainer_editor.blockSignals(False)
+        if refresh_party:
+            self.refresh_general_party_table()
+        self.refresh_general_trainers()
 
     def load_factory(self) -> None:
         self.factory_path = self.window.root / "src/battle_factory.c"; self.factory_source = read_utf8(self.factory_path) if self.factory_path.exists() else ""; self.factory_ranges.clear(); self.factory_ivs.clear(); self.range_states.clear(); self.iv_states.clear()
@@ -4719,6 +5099,133 @@ class BattleFrontierPanel(QWidget):
             values = [str(self.frontier_values.get(record.key, "")), record.key, self.species_names.get(species, species), self.item_names.get(item, item), str(self.mon_usage_counts.get(record.key, 0)), "yes" if record.key in self.factory_usage else "", *["✓" if flags[key] else "" for key in ("mega", "z", "dmax", "tera", "shiny", "unused")]]
             for column, value in enumerate(values):
                 item_widget = QTableWidgetItem(value); item_widget.setData(Qt.ItemDataRole.UserRole, record); self.mon_table.setItem(row, column, item_widget)
+
+    def has_pending_frontier_mon_changes(self) -> bool:
+        self.capture_mon()
+        return any(record.key in self.mon_states and self.proposed_mon_block(record) != record.block for record in self.records)
+
+    def normalize_frontier_mon_key(self, text: str) -> str:
+        name = re.sub(r"[^A-Za-z0-9_]+", "_", text.strip()).strip("_").upper()
+        if not name:
+            name = "CUSTOM"
+        if not name.startswith("FRONTIER_MON_"):
+            name = "FRONTIER_MON_" + name
+        base = name; suffix = 2
+        while name in self.frontier_values:
+            name = f"{base}_{suffix}"; suffix += 1
+        return name
+
+    def next_frontier_mon_value(self) -> int:
+        nums = [value for key, value in self.frontier_values.items() if key.startswith("FRONTIER_MON_")]
+        return max(nums, default=-1) + 1
+
+    def frontier_mon_block_from_values(self, key: str, values: dict[str, str]) -> str:
+        fields = [
+            ("species", values.get("species") or "SPECIES_NONE"),
+            ("moves", values.get("moves") or "{MOVE_NONE, MOVE_NONE, MOVE_NONE, MOVE_NONE}"),
+            ("heldItem", values.get("heldItem") or "ITEM_NONE"),
+            ("ev", values.get("ev") or ""),
+            ("iv", values.get("iv") or ""),
+            ("ability", values.get("ability") or ""),
+            ("lvl", values.get("lvl") or ""),
+            ("ball", values.get("ball") or "BALL_POKE"),
+            ("friendship", values.get("friendship") or ""),
+            ("nature", values.get("nature") or "NATURE_HARDY"),
+            ("gender", values.get("gender") or ""),
+            ("isShiny", values.get("isShiny") or ""),
+            ("teraType", values.get("teraType") or ""),
+            ("gigantamaxFactor", values.get("gigantamaxFactor") or ""),
+            ("shouldUseDynamax", values.get("shouldUseDynamax") or ""),
+            ("dynamaxLevel", values.get("dynamaxLevel") or ""),
+            ("tags", values.get("tags") or ""),
+        ]
+        lines = [f"    [{key}] = {{"]
+        nickname = values.get("nickname", "").strip()
+        if nickname:
+            lines.append(f"        .nickname = J_COMPOUND_STRING({quote_c_text(nickname)}),")
+        for field_name, value in fields:
+            if value in {"", "FALSE", "0"}:
+                continue
+            lines.append(f"        .{field_name} = {value},")
+        lines.append("    }")
+        return "\n".join(lines)
+
+    def write_frontier_mon_define(self, key: str, value: int) -> None:
+        path = self.window.root / "include/constants/battle_frontier_mons.h"
+        source = read_utf8(path)
+        match = re.search(r"(?m)^#define\s+NUM_FRONTIER_MONS\s+(\d+)\s*$", source)
+        if not match:
+            raise RuntimeError("NUM_FRONTIER_MONS was not found.")
+        old_num = int(match.group(1)); new_num = max(old_num, value + 1)
+        define_line = f"#define {key:<28} {value}\n"
+        num_line = re.sub(r"\d+", str(new_num), source[match.start():match.end()], count=1)
+        source = source[:match.start()] + define_line + num_line + source[match.end():]
+        write_with_backup(path, source)
+
+    def remove_frontier_mon_define(self, key: str) -> None:
+        path = self.window.root / "include/constants/battle_frontier_mons.h"
+        source = read_utf8(path)
+        updated = re.sub(rf"(?m)^#define\s+{re.escape(key)}\s+\d+\s*\r?\n", "", source)
+        if updated == source:
+            raise RuntimeError(f"{key} was not found in constants.")
+        write_with_backup(path, updated)
+
+    def add_frontier_mon(self) -> None:
+        if self.has_pending_frontier_mon_changes():
+            QMessageBox.warning(self, "Pending changes", "Save current Frontier mon changes before adding a new record."); return
+        current_species = self.combo_value(self.mon_species) if self.current_mon else "SPECIES_CUSTOM"
+        suggested = self.normalize_frontier_mon_key(current_species.replace("SPECIES_", ""))
+        text, ok = QInputDialog.getText(self, "Add Frontier Pokemon", "New FRONTIER_MON id:", text=suggested)
+        if not ok:
+            return
+        key = self.normalize_frontier_mon_key(text)
+        value = self.next_frontier_mon_value()
+        values = self.values_for_mon(self.current_mon) if self.current_mon else {"species": "SPECIES_NONE", "moves": "{MOVE_NONE, MOVE_NONE, MOVE_NONE, MOVE_NONE}", "heldItem": "ITEM_NONE", "ball": "BALL_POKE", "nature": "NATURE_HARDY"}
+        data_path = self.window.root / "src/data/battle_frontier/battle_frontier_mons.h"
+        try:
+            source = read_utf8(data_path)
+            insert_at = source.rfind("\n};")
+            if insert_at < 0:
+                raise RuntimeError("gBattleFrontierMons array end was not found.")
+            prefix = source[:insert_at].rstrip()
+            if not prefix.endswith(","):
+                prefix += ","
+            updated = prefix + "\n" + self.frontier_mon_block_from_values(key, values) + source[insert_at:]
+            assert_no_concatenated_designators(data_path, updated, self.window.root)
+            self.write_frontier_mon_define(key, value)
+            write_with_backup(data_path, updated)
+        except (OSError, RuntimeError) as error:
+            QMessageBox.critical(self, "Add failed", str(error)); return
+        self.load_reference_data(); self.load_frontier_mons(); self.refresh_mons(); self.select_mon_key(key); self.window.status(f"Added {key}")
+
+    def delete_frontier_mon(self) -> None:
+        if not self.current_mon:
+            return
+        if self.has_pending_frontier_mon_changes():
+            QMessageBox.warning(self, "Pending changes", "Save current Frontier mon changes before deleting a record."); return
+        record = self.current_mon
+        if self.mon_usage_counts.get(record.key, 0) or record.key in self.factory_usage:
+            QMessageBox.warning(self, "Delete blocked", "This Frontier Pokemon is used by trainer pools or Battle Factory ranges. Remove those references first."); return
+        if QMessageBox.question(self, "Delete Frontier Pokemon", f"Delete {record.key}?") != QMessageBox.StandardButton.Yes:
+            return
+        data_path = record.path
+        try:
+            source = read_utf8(data_path)
+            if source[record.start:record.end] != record.block:
+                raise RuntimeError(f"{rel(self.window.root, data_path)} changed on disk; reload before deleting.")
+            end = record.end
+            if end < len(source) and source[end] == ",":
+                end += 1
+            if source.startswith("\r\n", end):
+                end += 2
+            elif source.startswith("\n", end):
+                end += 1
+            updated = source[:record.start] + source[end:]
+            self.remove_frontier_mon_define(record.key)
+            write_with_backup(data_path, updated)
+        except (OSError, RuntimeError) as error:
+            QMessageBox.critical(self, "Delete failed", str(error)); return
+        self.load_reference_data(); self.load_frontier_mons(); self.refresh_mons(); self.window.status(f"Deleted {record.key}")
 
     def default_mon_values(self, record: SourceRecord) -> dict[str, str]:
         return {
@@ -4911,6 +5418,7 @@ class BattleFrontierPanel(QWidget):
 
     def capture_general_trainer(self) -> None:
         if self.current_general_trainer and not self.loading:
+            self.apply_general_party_mon(silent=True)
             self.general_trainer_states[self.current_general_trainer.key] = self.general_trainer_editor.toPlainText()
 
     def general_trainer_text(self, block: GeneralTrainerBlock) -> str:
@@ -4951,14 +5459,109 @@ class BattleFrontierPanel(QWidget):
         if not selected: return
         self.current_general_trainer = selected[0].data(Qt.ItemDataRole.UserRole)
         self.loading = True
+        self.general_name_edit.setText(self.current_general_trainer.name); self.general_class_edit.setText(self.current_general_trainer.trainer_class)
         self.general_trainer_editor.setPlainText(self.general_trainer_text(self.current_general_trainer))
+        self.general_party_editor.clear()
         self.loading = False
+        self.refresh_general_party_table()
         self.general_trainer_label.setText(f"{self.current_general_trainer.key} / {self.current_general_trainer.name} / {self.current_general_trainer.trainer_class} / Pokemon {self.current_general_trainer.party_count}")
 
     def general_trainer_changed(self) -> None:
         if self.loading or not self.current_general_trainer: return
-        self.general_trainer_states[self.current_general_trainer.key] = self.general_trainer_editor.toPlainText()
+        text = self.general_trainer_editor.toPlainText()
+        self.general_trainer_states[self.current_general_trainer.key] = text
+        self.general_name_edit.blockSignals(True); self.general_class_edit.blockSignals(True)
+        self.general_name_edit.setText(self.trainer_party_field(text, "Name")); self.general_class_edit.setText(self.trainer_party_field(text, "Class"))
+        self.general_name_edit.blockSignals(False); self.general_class_edit.blockSignals(False)
+        self.refresh_general_party_table()
         self.refresh_general_trainers(); self.window.status(f"Pending trainer.party block: {self.current_general_trainer.key}")
+
+    def general_fields_changed(self) -> None:
+        if self.loading or not self.current_general_trainer:
+            return
+        text = self.general_trainer_editor.toPlainText()
+        text = self.set_trainer_party_field(text, "Name", self.general_name_edit.text().strip())
+        text = self.set_trainer_party_field(text, "Class", self.general_class_edit.text().strip())
+        self.set_general_trainer_text(text)
+        self.window.status(f"Pending trainer fields: {self.current_general_trainer.key}")
+
+    def refresh_general_party_table(self) -> None:
+        if not hasattr(self, "general_party_table"):
+            return
+        text = self.general_trainer_editor.toPlainText() if self.current_general_trainer else ""
+        mons = self.trainer_party_mon_blocks(text)
+        self.general_party_table.blockSignals(True); self.general_party_table.setRowCount(len(mons))
+        for row, mon in enumerate(mons):
+            values = [str(mon.index + 1), mon.species, mon.level, mon.item]
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(value); item.setData(Qt.ItemDataRole.UserRole, mon); self.general_party_table.setItem(row, column, item)
+        self.general_party_table.blockSignals(False)
+
+    def select_general_party_mon(self) -> None:
+        selected = self.general_party_table.selectedItems()
+        if not selected:
+            return
+        mon = selected[0].data(Qt.ItemDataRole.UserRole)
+        if isinstance(mon, TrainerPartyMonBlock):
+            self.general_party_editor.setPlainText(mon.raw)
+
+    def apply_general_party_mon(self, silent: bool = False) -> None:
+        if not self.current_general_trainer:
+            return
+        selected = self.general_party_table.selectedItems()
+        if not selected:
+            return
+        mon = selected[0].data(Qt.ItemDataRole.UserRole)
+        if not isinstance(mon, TrainerPartyMonBlock):
+            return
+        replacement = self.general_party_editor.toPlainText().strip("\r\n")
+        if not replacement:
+            return
+        text = self.general_trainer_editor.toPlainText()
+        updated = text[:mon.start] + replacement + text[mon.end:]
+        self.set_general_trainer_text(updated)
+        self.select_general_party_index(mon.index)
+        if not silent:
+            self.window.status(f"Updated Pokemon {mon.index + 1}: {self.current_general_trainer.key}")
+
+    def select_general_party_index(self, index: int) -> None:
+        for row in range(self.general_party_table.rowCount()):
+            item = self.general_party_table.item(row, 0)
+            mon = item.data(Qt.ItemDataRole.UserRole) if item else None
+            if isinstance(mon, TrainerPartyMonBlock) and mon.index == index:
+                self.general_party_table.selectRow(row); return
+
+    def add_general_party_mon(self) -> None:
+        if not self.current_general_trainer:
+            return
+        text = self.general_trainer_editor.toPlainText()
+        addition = "SPECIES_NONE\nLevel: 50\nIVs: 0 HP / 0 Atk / 0 Def / 0 SpA / 0 SpD / 0 Spe\n- MOVE_NONE"
+        body_start = self.trainer_party_body_start(text)
+        if body_start >= len(text):
+            text = text.rstrip() + "\n\n" + addition + "\n"
+        else:
+            text = text.rstrip() + "\n\n" + addition + "\n"
+        self.set_general_trainer_text(text)
+        self.select_general_party_index(len(self.trainer_party_mon_blocks(text)) - 1)
+
+    def delete_general_party_mon(self) -> None:
+        if not self.current_general_trainer:
+            return
+        selected = self.general_party_table.selectedItems()
+        if not selected:
+            return
+        mon = selected[0].data(Qt.ItemDataRole.UserRole)
+        if not isinstance(mon, TrainerPartyMonBlock):
+            return
+        if QMessageBox.question(self, "Delete trainer Pokemon", f"Delete Pokemon {mon.index + 1}?") != QMessageBox.StandardButton.Yes:
+            return
+        text = self.general_trainer_editor.toPlainText()
+        start = mon.start
+        end = mon.end
+        while end < len(text) and text[end] in "\r\n":
+            end += 1
+        updated = text[:start].rstrip() + "\n\n" + text[end:].lstrip("\r\n")
+        self.set_general_trainer_text(updated)
 
     def save_general_trainer(self) -> None:
         self.capture_general_trainer()
@@ -5125,8 +5728,8 @@ class Workbench(QMainWindow):
         super().__init__(); self.settings = QSettings("PokemonDecompTools", "ExpansionStudio"); self.lang = self.settings.value("ui/language", "ja"); self.root = Path(self.settings.value("repo/root", str(Path.cwd()))); self.tool_dir = writable_tool_dir(); self.process: QProcess | None = None; self.command_log: QDialog | None = None
         self.loaded_panels: set[str] = set(); self.loading_depth = 0; self.auto_terminal_key = ""
         self.setStatusBar(QStatusBar()); self.make_toolbar(); self.loading_label = QLabel("読み込み中..."); self.loading_label.setVisible(False); self.statusBar().addPermanentWidget(self.loading_label); self.tabs = QTabWidget(); self.setCentralWidget(self.tabs)
-        self.translation = TranslationPanel(self); self.constants = ConstantsPanel(self); self.files = FileSearchPanel(self); self.index = CodeIndexPanel(self); self.species = PokemonStudioPanel(self); self.moves = MoveStudioPanel(self); self.frontier = BattleFrontierPanel(self); self.assets = AssetPanel(self); self.dependencies = DependencyPanel(self); self.fonts = FontPanel(self); self.poryscript = PoryscriptPanel(self); self.tool_settings = SettingsPanel(self)
-        self.panels: list[tuple[str, QWidget, Callable[[], None] | None]] = [("translation", self.translation, self.translation.load), ("constants", self.constants, self.constants.load), ("files", self.files, None), ("index", self.index, self.index.load), ("species", self.species, self.species.load), ("moves", self.moves, self.moves.load), ("frontier", self.frontier, self.frontier.load), ("assets", self.assets, self.assets.load), ("dependencies", self.dependencies, None), ("fonts", self.fonts, self.fonts.load), ("poryscript", self.poryscript, self.poryscript.load), ("settings", self.tool_settings, self.tool_settings.load)]
+        self.translation = TranslationPanel(self); self.constants = ConstantsPanel(self); self.files = FileSearchPanel(self); self.index = CodeIndexPanel(self); self.rom_layout = RomLayoutPanel(self); self.species = PokemonStudioPanel(self); self.moves = MoveStudioPanel(self); self.frontier = BattleFrontierPanel(self); self.assets = AssetPanel(self); self.dependencies = DependencyPanel(self); self.fonts = FontPanel(self); self.poryscript = PoryscriptPanel(self); self.tool_settings = SettingsPanel(self)
+        self.panels: list[tuple[str, QWidget, Callable[[], None] | None]] = [("translation", self.translation, self.translation.load), ("constants", self.constants, self.constants.load), ("files", self.files, None), ("index", self.index, self.index.load), ("rom_layout", self.rom_layout, self.rom_layout.load), ("species", self.species, self.species.load), ("moves", self.moves, self.moves.load), ("frontier", self.frontier, self.frontier.load), ("assets", self.assets, self.assets.load), ("dependencies", self.dependencies, None), ("fonts", self.fonts, self.fonts.load), ("poryscript", self.poryscript, self.poryscript.load), ("settings", self.tool_settings, self.tool_settings.load)]
         for key, panel, _loader in self.panels: self.tabs.addTab(panel, tr(key, self.lang))
         self.tabs.currentChanged.connect(lambda _index: self.load_current())
         self.retranslate(); self.apply_readability_style(); self.resize(1580, 960)

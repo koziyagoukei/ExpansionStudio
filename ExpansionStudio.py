@@ -11,11 +11,14 @@ from __future__ import annotations
 import csv
 import copy
 import difflib
+import hashlib
 import json
 import os
 import re
 import shutil
+import struct
 import sys
+import zlib
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -113,9 +116,13 @@ LANG = {
 }
 LANG["ja"]["index"] = "インデックス"
 LANG["ja"]["rom_layout"] = "ROM Layout"
+LANG["ja"]["rom_binary"] = "ROM Binary"
 LANG["ja"]["maps"] = "Maps / Encounters"
+LANG["ja"]["patches"] = "Patches"
 LANG["en"]["rom_layout"] = "ROM Layout"
+LANG["en"]["rom_binary"] = "ROM Binary"
 LANG["en"]["maps"] = "Maps / Encounters"
+LANG["en"]["patches"] = "Patches"
 
 
 def tr(key: str, lang: str) -> str:
@@ -296,6 +303,41 @@ def quote_c_text(value: str) -> str:
             out.append(char)
     out.append('"')
     return "".join(out)
+
+
+def source_newline(source: str) -> str:
+    return "\r\n" if "\r\n" in source else "\n"
+
+
+def normalize_constant_suffix(value: str, prefix: str) -> str:
+    suffix = value.strip().upper()
+    if suffix.startswith(prefix):
+        suffix = suffix[len(prefix):]
+    suffix = re.sub(r"[^A-Z0-9]+", "_", suffix).strip("_")
+    if not suffix or suffix[0].isdigit():
+        raise ValueError("Internal ID must start with a letter and contain letters, numbers, or underscores.")
+    return suffix
+
+
+def prefixed_constant(value: str, prefix: str) -> str:
+    return prefix + normalize_constant_suffix(value, prefix)
+
+
+def constant_suffix_pascal(value: str, prefix: str) -> str:
+    suffix = normalize_constant_suffix(value, prefix)
+    return "".join(part.title() for part in suffix.lower().split("_") if part)
+
+
+def display_name_with_jpn(value: str) -> str:
+    text = value.strip() or "New"
+    return text if text.startswith("{") else "{JPN}" + text
+
+
+def insert_before_array_end(source: str, insertion: str) -> str:
+    match = re.search(r"\n\};\s*$", source)
+    if not match:
+        raise RuntimeError("Could not find final array terminator.")
+    return source[:match.start()] + insertion + source[match.start():]
 
 
 def read_define_int(root: Path, name: str, default: int) -> int:
@@ -764,12 +806,14 @@ class TranslationTextPanel(QWidget):
         self.file_filter = QLineEdit()
         self.untranslated = QCheckBox()
         self.changed = QCheckBox()
+        self.sort_mode = QComboBox()
         self.count = QLabel()
         self.table = QTableWidget(0, 6)
         self.table.setHorizontalHeaderLabels(["*", "Symbol", "Kind", "Text", "File", "Line"])
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.table.itemSelectionChanged.connect(self.select_entry)
+        self.table.horizontalHeader().sectionClicked.connect(self.header_sort)
         self.original = QPlainTextEdit(); self.original.setReadOnly(True)
         self.editor = QPlainTextEdit(); self.editor.textChanged.connect(self.edit_changed)
         self.char_count = QLabel("0")
@@ -786,8 +830,16 @@ class TranslationTextPanel(QWidget):
         self.untranslated.stateChanged.connect(self.refresh)
         self.changed.stateChanged.connect(self.refresh)
         filters.addWidget(self.untranslated); filters.addWidget(self.changed)
+        self.sort_mode.addItem("Default", "default")
+        self.sort_mode.addItem("File + Line", "file_line")
+        self.sort_mode.addItem("Symbol / Label", "symbol")
+        self.sort_mode.currentIndexChanged.connect(self.refresh)
+        filters.addWidget(QLabel("Sort"))
+        filters.addWidget(self.sort_mode)
         clear = QPushButton(); clear.clicked.connect(self.clear_filters); filters.addWidget(clear)
         self._clear_button = clear
+        filters.addWidget(self.count)
+        filters.addStretch()
         layout.addLayout(filters)
         split = QSplitter(Qt.Orientation.Horizontal)
         split.addWidget(self.table)
@@ -826,6 +878,24 @@ class TranslationTextPanel(QWidget):
         self.current = None; self.original.clear(); self.editor.clear(); self.refresh()
         self.window.status(f"Scanned {len(self.entries)} text entries")
 
+    def sorted_entries(self, entries: list[TextEntry]) -> list[TextEntry]:
+        mode = self.sort_mode.currentData() if hasattr(self, "sort_mode") else "default"
+        if mode == "file_line":
+            return sorted(entries, key=lambda entry: (entry.file_name.casefold(), entry.line, entry.start, entry.symbol.casefold()))
+        if mode == "symbol":
+            return sorted(entries, key=lambda entry: (entry.symbol.casefold(), entry.file_name.casefold(), entry.line, entry.start))
+        return entries
+
+    def header_sort(self, column: int) -> None:
+        if column in {4, 5}:
+            index = self.sort_mode.findData("file_line")
+            if index >= 0:
+                self.sort_mode.setCurrentIndex(index)
+        elif column == 1:
+            index = self.sort_mode.findData("symbol")
+            if index >= 0:
+                self.sort_mode.setCurrentIndex(index)
+
     def filtered(self) -> list[TextEntry]:
         query = self.search.text().casefold().strip(); file_name = self.file_filter.text().casefold().strip()
         result = []
@@ -840,7 +910,7 @@ class TranslationTextPanel(QWidget):
         return result
 
     def refresh(self) -> None:
-        visible = self.filtered(); selected = self.current
+        visible = self.sorted_entries(self.filtered()); selected = self.current
         self.table.setRowCount(len(visible))
         for row, entry in enumerate(visible):
             values = ["*" if entry.dirty else "", entry.symbol, entry.macro,
@@ -1226,6 +1296,7 @@ class EventBrowserPanel(QWidget):
     """INC text manager plus event/text cross references for translation work."""
     def __init__(self, window: "Workbench", translation: TranslationTextPanel) -> None:
         super().__init__(); self.window = window; self.translation = translation; self.scripts: list[EventScript] = []; self.inc_texts: list[EventTextEntry] = []; self.pory_texts: list[PoryTextEntry] = []; self.inc_contents: dict[Path, str] = {}; self.definitions: dict[TextIdentity, TextTarget] = {}; self.symbol_index: dict[str, list[TextIdentity]] = {}; self.uses_by_target: dict[TextIdentity, list[EventTextUse]] = {}; self.text_rows: list[TextIdentity] = []; self.current_id: TextIdentity | None = None; self.loading = False; self.edited_source_ids: set[TextIdentity] = set()
+        self.sort_mode = QComboBox(); self.sort_mode.addItem("Default", "default"); self.sort_mode.addItem("File + Line", "file_line"); self.sort_mode.addItem("Symbol / Label", "symbol"); self.sort_mode.currentIndexChanged.connect(self.refresh); self._sort_controls_added = False; self._sort_headers_connected = False
         layout = QVBoxLayout(self); filters = QHBoxLayout(); self.search = QLineEdit(); self.search.setPlaceholderText("ラベル名・本文・ファイル・イベントを検索"); self.search.textChanged.connect(self.refresh); clear = QPushButton("クリア"); clear.clicked.connect(self.search.clear); self.count = QLabel(); filters.addWidget(self.search); filters.addWidget(clear); filters.addWidget(self.count); filters.addStretch(); layout.addLayout(filters)
         split = QSplitter(Qt.Orientation.Horizontal); left = QSplitter(Qt.Orientation.Vertical); self.text_table = QTableWidget(0, 7); self.text_table.setHorizontalHeaderLabels(["種別", "ラベル", "本文", "ファイル", "行", "使用", "状態"]); self.text_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows); self.text_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers); self.text_table.itemSelectionChanged.connect(self.select_text_row); left.addWidget(self.text_table); self.tree = QTreeWidget(); self.tree.setHeaderLabels(["イベント構造", "種類"]); self.tree.itemSelectionChanged.connect(self.select_tree_item); left.addWidget(self.tree); left.setSizes([460, 420]); split.addWidget(left)
         detail = QWidget(); detail_layout = QVBoxLayout(detail); self.detail = QLabel("テキストまたはイベントを選択してください。"); self.detail.setWordWrap(True); detail_layout.addWidget(self.detail); detail_layout.addWidget(QLabel("イベント本文 / 相互参照")); self.context = QPlainTextEdit(); self.context.setReadOnly(True); self.context.setMaximumHeight(160); detail_layout.addWidget(self.context); detail_layout.addWidget(QLabel("元のテキスト（INC の末尾 $ は非表示）")); self.original = QPlainTextEdit(); self.original.setReadOnly(True); self.original.setMaximumHeight(110); detail_layout.addWidget(self.original); detail_layout.addWidget(QLabel("翻訳テキスト")); self.editor = QPlainTextEdit(); self.editor.setEnabled(False); self.editor.textChanged.connect(self.edit_changed); detail_layout.addWidget(self.editor); detail_layout.addWidget(QLabel("使用箇所 / 使用テキスト")); self.references = QListWidget(); self.references.itemDoubleClicked.connect(self.open_reference); detail_layout.addWidget(self.references); controls = QHBoxLayout(); revert = QPushButton("元に戻す"); revert.clicked.connect(self.revert); self.diff_button = QPushButton("差分"); self.diff_button.clicked.connect(self.show_diff); self.format_button = QPushButton("自動整形"); self.format_button.clicked.connect(self.open_auto_format); self.save_button = QPushButton("保存"); self.save_button.clicked.connect(self.save); controls.addWidget(revert); controls.addWidget(self.diff_button); controls.addWidget(self.format_button); controls.addStretch(); controls.addWidget(self.save_button); detail_layout.addLayout(controls); split.addWidget(detail); split.setSizes([850, 650]); layout.addWidget(split)
@@ -1282,11 +1353,58 @@ class EventBrowserPanel(QWidget):
             target = self.target_for_use(use); values.extend((use.command, use.symbol, target.current if target else use.resolution))
         return query in "\n".join(values).casefold()
 
+    def ensure_sort_controls(self) -> None:
+        if not self._sort_controls_added and self.layout() and self.layout().itemAt(0):
+            filter_layout = self.layout().itemAt(0).layout()
+            if filter_layout is not None:
+                filter_layout.insertWidget(1, QLabel("Sort"))
+                filter_layout.insertWidget(2, self.sort_mode)
+                self._sort_controls_added = True
+        if not self._sort_headers_connected:
+            self.text_table.horizontalHeader().sectionClicked.connect(self.header_sort)
+            self.tree.header().sectionClicked.connect(self.tree_header_sort)
+            self._sort_headers_connected = True
+
+    def set_sort_mode(self, mode: str) -> None:
+        index = self.sort_mode.findData(mode)
+        if index >= 0:
+            self.sort_mode.setCurrentIndex(index)
+
+    def header_sort(self, column: int) -> None:
+        if column in {3, 4}:
+            self.set_sort_mode("file_line")
+        elif column == 1:
+            self.set_sort_mode("symbol")
+
+    def tree_header_sort(self, column: int) -> None:
+        self.set_sort_mode("symbol" if column == 0 else "default")
+
+    def target_file_line_key(self, key: TextIdentity) -> tuple[str, int, str, str]:
+        target = self.definitions[key]
+        return (target.file_name.casefold(), target.line, key[0].casefold(), target.symbol.casefold())
+
+    def sorted_text_keys(self, keys: list[TextIdentity]) -> list[TextIdentity]:
+        mode = self.sort_mode.currentData() if hasattr(self, "sort_mode") else "default"
+        if mode == "file_line":
+            return sorted(keys, key=self.target_file_line_key)
+        if mode == "symbol":
+            return sorted(keys, key=lambda key: (self.definitions[key].symbol.casefold(), self.definitions[key].file_name.casefold(), self.definitions[key].line, key[0].casefold()))
+        return keys
+
+    def sorted_scripts(self, scripts: list[EventScript]) -> list[EventScript]:
+        mode = self.sort_mode.currentData() if hasattr(self, "sort_mode") else "default"
+        if mode == "file_line":
+            return sorted(scripts, key=lambda script: (script.file_name.casefold(), script.line, script.label.casefold()))
+        if mode == "symbol":
+            return sorted(scripts, key=lambda script: (script.label.casefold(), script.file_name.casefold(), script.line))
+        return scripts
+
     def refresh(self) -> None:
+        self.ensure_sort_controls()
         self.refresh_text_table(); self.refresh_tree()
 
     def refresh_text_table(self) -> None:
-        query = self.search.text().casefold().strip(); visible = [key for key in self.text_rows if key in self.definitions and self.target_matches(self.definitions[key], query)]; self.text_table.blockSignals(True); self.text_table.setRowCount(len(visible))
+        query = self.search.text().casefold().strip(); visible = self.sorted_text_keys([key for key in self.text_rows if key in self.definitions and self.target_matches(self.definitions[key], query)]); self.text_table.blockSignals(True); self.text_table.setRowCount(len(visible))
         for row, key in enumerate(visible):
             target = self.definitions[key]; uses = len(self.uses_by_target.get(key, [])); status = "対応" if self.target_editable(target) else (target.unsupported_reason if isinstance(target, EventTextEntry) else "参照のみ")
             values = [key[0], target.symbol, target.current.replace("\n", r"\n")[:180], target.file_name, str(target.line), str(uses), status]
@@ -1297,8 +1415,7 @@ class EventBrowserPanel(QWidget):
 
     def refresh_tree(self) -> None:
         query = self.search.text().casefold().strip(); current = self.current_id; self.tree.blockSignals(True); self.tree.clear(); files: dict[str, QTreeWidgetItem] = {}; visible = 0
-        for script in self.scripts:
-            if not self.script_matches(script, query): continue
+        for script in self.sorted_scripts([script for script in self.scripts if self.script_matches(script, query)]):
             visible += 1; file_item = files.get(script.file_name)
             if file_item is None:
                 file_item = QTreeWidgetItem([script.file_name, "file"]); files[script.file_name] = file_item; self.tree.addTopLevelItem(file_item)
@@ -2533,10 +2650,24 @@ class RomLayoutPanel(QWidget):
         filters = QHBoxLayout(); self.query = QLineEdit(); self.query.setPlaceholderText("symbol search"); self.query.textChanged.connect(self.refresh); self.section_filter = QLineEdit(); self.section_filter.setPlaceholderText("section filter"); self.section_filter.textChanged.connect(self.refresh); self.object_filter = QLineEdit(); self.object_filter.setPlaceholderText("object file filter"); self.object_filter.textChanged.connect(self.refresh); self.rom_only = QCheckBox("ROM symbols only"); self.rom_only.setChecked(True); self.rom_only.stateChanged.connect(self.refresh)
         filters.addWidget(self.query, 2); filters.addWidget(self.section_filter); filters.addWidget(self.object_filter); filters.addWidget(self.rom_only); layout.addLayout(filters)
         self.warning = QLabel(); self.warning.setWordWrap(True); layout.addWidget(self.warning)
+        binary_box = QGroupBox("Binary preview")
+        binary_layout = QVBoxLayout(binary_box)
+        self.binary_table = QTableWidget(0, 18)
+        self.binary_table.setHorizontalHeaderLabels(["Offset", *[f"{index:02X}" for index in range(16)], "ASCII"])
+        self.binary_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.binary_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectItems)
+        self.binary_table.setFont(QFont("Consolas", 10))
+        self.binary_table.setObjectName("romLayoutBinaryPreview")
+        self.binary_table.verticalHeader().setVisible(False)
+        self.binary_table.setMaximumHeight(210)
+        for column, width in enumerate([88, *([38] * 16), 140]):
+            self.binary_table.setColumnWidth(column, width)
+        binary_layout.addWidget(self.binary_table)
+        layout.addWidget(binary_box)
         split = QSplitter(Qt.Orientation.Horizontal); self.table = QTableWidget(0, 6); self.table.setHorizontalHeaderLabels(["Symbol", "GBA Address", "ROM Offset", "Estimated Size", "Section", "Object File"]); self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows); self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers); self.table.itemSelectionChanged.connect(self.select_symbol); split.addWidget(self.table)
-        detail = QWidget(); detail_layout = QVBoxLayout(detail); self.detail = QLabel("Select a ROM symbol."); self.detail.setWordWrap(True); detail_layout.addWidget(self.detail); detail_layout.addWidget(QLabel("Hex preview")); self.hex_preview = QPlainTextEdit(); self.hex_preview.setReadOnly(True); detail_layout.addWidget(self.hex_preview); detail_layout.addWidget(QLabel("Related source candidates")); self.sources = QListWidget(); self.sources.itemDoubleClicked.connect(lambda _item: self.jump_to_definition()); detail_layout.addWidget(self.sources)
-        buttons = QHBoxLayout(); self.copy_name_button = QPushButton("Copy name"); self.copy_name_button.clicked.connect(self.copy_name); self.copy_address_button = QPushButton("Copy GBA address"); self.copy_address_button.clicked.connect(self.copy_address); self.copy_offset_button = QPushButton("Copy ROM offset"); self.copy_offset_button.clicked.connect(self.copy_offset); self.jump_button = QPushButton("Jump to definition"); self.jump_button.clicked.connect(self.jump_to_definition)
-        for button in (self.copy_name_button, self.copy_address_button, self.copy_offset_button, self.jump_button): buttons.addWidget(button)
+        detail = QWidget(); detail_layout = QVBoxLayout(detail); self.detail = QLabel("Select a ROM symbol."); self.detail.setWordWrap(True); detail_layout.addWidget(self.detail); detail_layout.addWidget(QLabel("Hex preview")); self.hex_preview = QPlainTextEdit(); self.hex_preview.setReadOnly(True); self.hex_preview.setFont(QFont("Consolas", 10)); detail_layout.addWidget(self.hex_preview); detail_layout.addWidget(QLabel("Related source candidates")); self.sources = QListWidget(); self.sources.itemDoubleClicked.connect(lambda _item: self.jump_to_definition()); detail_layout.addWidget(self.sources)
+        buttons = QHBoxLayout(); self.copy_name_button = QPushButton("Copy name"); self.copy_name_button.clicked.connect(self.copy_name); self.copy_address_button = QPushButton("Copy GBA address"); self.copy_address_button.clicked.connect(self.copy_address); self.copy_offset_button = QPushButton("Copy ROM offset"); self.copy_offset_button.clicked.connect(self.copy_offset); self.jump_button = QPushButton("Jump to definition"); self.jump_button.clicked.connect(self.jump_to_definition); self.binary_button = QPushButton("Open binary"); self.binary_button.clicked.connect(self.open_binary_viewer)
+        for button in (self.copy_name_button, self.copy_address_button, self.copy_offset_button, self.jump_button, self.binary_button): buttons.addWidget(button)
         detail_layout.addLayout(buttons); split.addWidget(detail); stabilize_splitter(split, 2, 1); split.setSizes([980, 560]); layout.addWidget(split)
 
     def display_path(self, path: Path | None) -> str:
@@ -2559,6 +2690,7 @@ class RomLayoutPanel(QWidget):
         self.elf_label.setText("ELF: -")
         self.warning.clear()
         self.hex_preview.clear()
+        self.binary_table.setRowCount(0)
         self.sources.clear()
         self.table.setRowCount(0)
 
@@ -2661,23 +2793,30 @@ class RomLayoutPanel(QWidget):
         self.detail.setText(f"{symbol.name}\nGBA address: 0x{symbol.address:08X}\nROM offset: {self.hex_value(symbol.rom_offset)}\nSize: {self.hex_value(symbol.estimated_size)} estimated\nSection: {symbol.section}\nObject: {symbol.object_file}")
         self.show_hex_preview(symbol)
         self.show_source_candidates(symbol.name)
+        binary = getattr(self.window, "rom_binary", None)
+        if binary is not None:
+            binary.jump_to_symbol(symbol, switch=False)
 
     def show_hex_preview(self, symbol: RomMapSymbol) -> None:
         offset = symbol.rom_offset
         if offset is None:
             self.hex_preview.setPlainText("No ROM offset for this symbol.")
+            self.set_binary_preview_message("No ROM offset")
             return
         if not self.gba_path or not self.gba_path.exists():
             self.hex_preview.setPlainText("No .gba file selected.")
+            self.set_binary_preview_message("No .gba")
             return
         size = self.gba_path.stat().st_size
         if offset < 0 or offset >= size:
             self.hex_preview.setPlainText("ROM offset is outside the selected .gba file.")
+            self.set_binary_preview_message("Outside ROM")
             return
         read_size = min(256, max(64, symbol.estimated_size or 64), size - offset)
         with self.gba_path.open("rb") as handle:
             handle.seek(offset)
             data = handle.read(read_size)
+        self.populate_binary_preview(offset, data)
         lines = []
         for base in range(0, len(data), 16):
             chunk = data[base:base + 16]
@@ -2685,6 +2824,25 @@ class RomLayoutPanel(QWidget):
             ascii_part = "".join(chr(byte) if 32 <= byte < 127 else "." for byte in chunk)
             lines.append(f"{offset + base:08X}  {hex_part:<47}  {ascii_part}")
         self.hex_preview.setPlainText("\n".join(lines))
+
+    def set_binary_preview_message(self, message: str) -> None:
+        self.binary_table.setRowCount(1)
+        for column in range(self.binary_table.columnCount()):
+            self.binary_table.setItem(0, column, QTableWidgetItem(""))
+        self.binary_table.setItem(0, 0, QTableWidgetItem(message))
+
+    def populate_binary_preview(self, offset: int, data: bytes) -> None:
+        row_count = (len(data) + 15) // 16
+        self.binary_table.setRowCount(row_count)
+        for row in range(row_count):
+            base = row * 16
+            chunk = data[base:base + 16]
+            self.binary_table.setItem(row, 0, QTableWidgetItem(f"{offset + base:08X}"))
+            for column in range(16):
+                text = f"{chunk[column]:02X}" if column < len(chunk) else ""
+                self.binary_table.setItem(row, column + 1, QTableWidgetItem(text))
+            ascii_part = "".join(chr(byte) if 32 <= byte < 127 else "." for byte in chunk)
+            self.binary_table.setItem(row, 17, QTableWidgetItem(ascii_part))
 
     def exact_source_search(self, name: str) -> list[CodeIndexEntry]:
         if name in self.source_cache:
@@ -2758,6 +2916,516 @@ class RomLayoutPanel(QWidget):
     def copy_offset(self) -> None:
         if self.current:
             text = self.hex_value(self.current.rom_offset); QApplication.clipboard().setText(text); self.window.status(text)
+
+    def open_binary_viewer(self) -> None:
+        if not self.current:
+            self.window.status("No ROM layout symbol selected")
+            return
+        binary = getattr(self.window, "rom_binary", None)
+        if binary is None:
+            self.window.status("ROM Binary Viewer is not available")
+            return
+        binary.jump_to_symbol(self.current, switch=True)
+
+
+class RomBinaryViewerPanel(QWidget):
+    """Read-only Stirling-style ROM hex/ASCII viewer."""
+    BYTES_PER_VIEW = 0x200
+
+    def __init__(self, window: "Workbench") -> None:
+        super().__init__()
+        self.window = window
+        self.gba_path: Path | None = None
+        self.current_offset = 0
+        layout = QVBoxLayout(self)
+
+        files = QHBoxLayout()
+        self.gba_edit = QLineEdit()
+        self.gba_edit.setReadOnly(True)
+        self.gba_edit.setPlaceholderText("pokeemerald.gba")
+        self.choose_button = QPushButton("Select GBA")
+        self.choose_button.clicked.connect(self.choose_gba)
+        self.reload_button = QPushButton("Reload")
+        self.reload_button.clicked.connect(lambda: self.load(force=True))
+        files.addWidget(QLabel("gba path"))
+        files.addWidget(self.gba_edit, 1)
+        files.addWidget(self.choose_button)
+        files.addWidget(self.reload_button)
+        layout.addLayout(files)
+
+        jumps = QHBoxLayout()
+        self.offset_jump = QLineEdit()
+        self.offset_jump.setPlaceholderText("ROM offset, e.g. 0x700840")
+        self.offset_button = QPushButton("Jump offset")
+        self.offset_button.clicked.connect(self.jump_to_offset_input)
+        self.gba_jump = QLineEdit()
+        self.gba_jump.setPlaceholderText("GBA address, e.g. 0x08700840")
+        self.gba_button = QPushButton("Jump GBA address")
+        self.gba_button.clicked.connect(self.jump_to_gba_input)
+        jumps.addWidget(self.offset_jump)
+        jumps.addWidget(self.offset_button)
+        jumps.addWidget(self.gba_jump)
+        jumps.addWidget(self.gba_button)
+        layout.addLayout(jumps)
+
+        self.status = QLabel("ROM editing is not implemented. This viewer is read-only.")
+        self.status.setWordWrap(True)
+        layout.addWidget(self.status)
+
+        self.table = QTableWidget(0, 18)
+        self.table.setHorizontalHeaderLabels(["Offset", *[f"{index:02X}" for index in range(16)], "ASCII"])
+        self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectItems)
+        self.table.setFont(QFont("Consolas", 10))
+        self.table.setObjectName("romBinaryTable")
+        self.table.verticalHeader().setVisible(False)
+        self.table.setMinimumHeight(620)
+        for column, width in enumerate([96, *([40] * 16), 180]):
+            self.table.setColumnWidth(column, width)
+        layout.addWidget(self.table, 1)
+
+    def display_path(self, path: Path | None) -> str:
+        if not path:
+            return ""
+        try:
+            return path.relative_to(self.window.root).as_posix()
+        except ValueError:
+            return path.name
+
+    def reset_loaded(self) -> None:
+        self.gba_path = None
+        self.current_offset = 0
+        self.gba_edit.clear()
+        self.table.setRowCount(0)
+        self.status.setText("ROM editing is not implemented. This viewer is read-only.")
+
+    def detect_gba(self) -> None:
+        if self.gba_path is None:
+            path = self.window.root / "pokeemerald.gba"
+            self.gba_path = path if path.exists() else None
+        self.gba_edit.setText(self.display_path(self.gba_path))
+
+    def choose_gba(self) -> None:
+        selected, _ = QFileDialog.getOpenFileName(self, "Select GBA file", str(self.window.root), "GBA files (*.gba);;All files (*)")
+        if selected:
+            self.gba_path = Path(selected)
+            self.current_offset = 0
+            self.load(force=True)
+
+    def load(self, force: bool = False) -> None:
+        if not self.window.root_valid():
+            return
+        self.detect_gba()
+        if not self.gba_path or not self.gba_path.exists():
+            self.set_message("pokeemerald.gba was not found. Select a .gba file to view binary data.")
+            return
+        self.render_at_offset(self.current_offset)
+
+    @staticmethod
+    def parse_address_text(text: str) -> int:
+        cleaned = text.strip().replace("_", "")
+        if not cleaned:
+            raise ValueError("Address is empty.")
+        if cleaned.lower().startswith("0x"):
+            return int(cleaned, 16)
+        return int(cleaned, 16)
+
+    def jump_to_offset_input(self) -> None:
+        try:
+            offset = self.parse_address_text(self.offset_jump.text())
+        except ValueError as error:
+            self.set_message(f"Invalid ROM offset: {error}")
+            return
+        self.jump_to_rom_offset(offset, "manual ROM offset")
+
+    def jump_to_gba_input(self) -> None:
+        try:
+            address = self.parse_address_text(self.gba_jump.text())
+        except ValueError as error:
+            self.set_message(f"Invalid GBA address: {error}")
+            return
+        if address < ROM_ADDRESS_BASE:
+            self.set_message("GBA address must be in ROM space at 0x08000000 or higher.")
+            return
+        self.jump_to_rom_offset(address - ROM_ADDRESS_BASE, f"GBA address 0x{address:08X}")
+
+    def jump_to_symbol(self, symbol: RomMapSymbol, switch: bool = False) -> None:
+        if switch:
+            self.window.tabs.setCurrentWidget(self)
+        offset = symbol.rom_offset
+        if offset is None:
+            self.set_message(f"{symbol.name}: no ROM offset for this symbol.")
+            return
+        self.offset_jump.setText(f"0x{offset:X}")
+        self.gba_jump.setText(f"0x{symbol.address:08X}")
+        self.jump_to_rom_offset(offset, symbol.name)
+
+    def jump_to_rom_offset(self, offset: int, source_label: str = "") -> None:
+        if offset < 0:
+            self.set_message("ROM offset must not be negative.")
+            return
+        self.current_offset = offset
+        self.load(force=False)
+        if source_label:
+            self.window.status(f"ROM Binary Viewer: {source_label} -> 0x{offset:X}")
+
+    def render_at_offset(self, offset: int) -> None:
+        if not self.gba_path or not self.gba_path.exists():
+            self.set_message("No .gba file selected.")
+            return
+        size = self.gba_path.stat().st_size
+        if offset >= size:
+            self.set_message(f"ROM offset 0x{offset:X} is outside the selected .gba file.")
+            return
+        aligned = offset & ~0xF
+        read_size = min(self.BYTES_PER_VIEW, size - aligned)
+        with self.gba_path.open("rb") as handle:
+            handle.seek(aligned)
+            data = handle.read(read_size)
+        self.populate_table(aligned, data)
+        self.status.setText(f"Read-only view: offset 0x{offset:X} / file size 0x{size:X}")
+
+    def set_message(self, message: str) -> None:
+        self.status.setText(message)
+        self.table.setRowCount(1)
+        for column in range(self.table.columnCount()):
+            self.table.setItem(0, column, QTableWidgetItem(""))
+        self.table.setItem(0, 0, QTableWidgetItem(message))
+
+    def populate_table(self, offset: int, data: bytes) -> None:
+        row_count = (len(data) + 15) // 16
+        self.table.setRowCount(row_count)
+        for row in range(row_count):
+            base = row * 16
+            chunk = data[base:base + 16]
+            self.table.setItem(row, 0, QTableWidgetItem(f"{offset + base:08X}"))
+            for column in range(16):
+                text = f"{chunk[column]:02X}" if column < len(chunk) else ""
+                item = QTableWidgetItem(text)
+                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                self.table.setItem(row, column + 1, item)
+            ascii_part = "".join(chr(byte) if 32 <= byte < 127 else "." for byte in chunk)
+            self.table.setItem(row, 17, QTableWidgetItem(ascii_part))
+
+
+PATCH_METADATA = "Created by Expansion Studio"
+
+
+@dataclass(frozen=True)
+class KnownBaseRom:
+    label: str
+    size: int
+    crc32: str
+    md5: str
+    sha1: str
+
+
+KNOWN_EMERALD_BASE_ROMS = (
+    KnownBaseRom(
+        "Pokemon - Emerald Version (USA, Europe)",
+        16777216,
+        "1F1C08FB",
+        "605B89B67018ABCEA91E693A4DD25BE3",
+        "F3AE088181BF583E55DAF962A92BB46F4F1D07B7",
+    ),
+    KnownBaseRom(
+        "Pocket Monsters - Emerald (Japan)",
+        16777216,
+        "4881F3F8",
+        "92EECF93F1AB828BDF2A83DADDACF3E5",
+        "D7CF8F156BA9C455D164E1EA780A6BF1945465C2",
+    ),
+)
+
+
+def rom_fingerprint(data: bytes) -> dict[str, str | int]:
+    return {
+        "size": len(data),
+        "crc32": f"{zlib.crc32(data) & 0xFFFFFFFF:08X}",
+        "md5": hashlib.md5(data).hexdigest().upper(),
+        "sha1": hashlib.sha1(data).hexdigest().upper(),
+    }
+
+
+def match_known_emerald_base_rom(data: bytes) -> tuple[KnownBaseRom | None, dict[str, str | int]]:
+    fingerprint = rom_fingerprint(data)
+    for known in KNOWN_EMERALD_BASE_ROMS:
+        if (
+            fingerprint["size"] == known.size
+            and fingerprint["crc32"] == known.crc32
+            and fingerprint["md5"] == known.md5
+            and fingerprint["sha1"] == known.sha1
+        ):
+            return known, fingerprint
+    return None, fingerprint
+
+
+def fingerprint_text(fingerprint: dict[str, str | int]) -> str:
+    return (
+        f"Size: {fingerprint['size']} bytes\n"
+        f"CRC32: {fingerprint['crc32']}\n"
+        f"MD5: {fingerprint['md5']}\n"
+        f"SHA1: {fingerprint['sha1']}"
+    )
+
+
+def known_base_rom_list_text() -> str:
+    lines = ["Allowed original ROMs:"]
+    for known in KNOWN_EMERALD_BASE_ROMS:
+        lines.append(f"- {known.label}")
+        lines.append(f"  Size: {known.size} bytes")
+        lines.append(f"  CRC32: {known.crc32}")
+        lines.append(f"  MD5: {known.md5}")
+        lines.append(f"  SHA1: {known.sha1}")
+    return "\n".join(lines)
+
+
+def patch_display_path(root: Path, path: Path | None) -> str:
+    if not path:
+        return ""
+    try:
+        return path.relative_to(root).as_posix()
+    except ValueError:
+        return path.name
+
+
+def bps_encode_number(value: int) -> bytes:
+    encoded = bytearray()
+    while True:
+        byte = value & 0x7F
+        value >>= 7
+        if value == 0:
+            encoded.append(byte | 0x80)
+            break
+        encoded.append(byte)
+        value -= 1
+    return bytes(encoded)
+
+
+def bps_command(action: int, length: int) -> bytes:
+    return bps_encode_number(((length - 1) << 2) | action)
+
+
+def create_bps_patch(source: bytes, target: bytes, metadata: str = PATCH_METADATA) -> bytes:
+    patch = bytearray(b"BPS1")
+    patch += bps_encode_number(len(source))
+    patch += bps_encode_number(len(target))
+    metadata_bytes = metadata.encode("utf-8")
+    patch += bps_encode_number(len(metadata_bytes))
+    patch += metadata_bytes
+    pos = 0
+    while pos < len(target):
+        if pos < len(source) and source[pos] == target[pos]:
+            start = pos
+            while pos < len(target) and pos < len(source) and source[pos] == target[pos]:
+                pos += 1
+            patch += bps_command(0, pos - start)
+        else:
+            start = pos
+            while pos < len(target) and not (pos < len(source) and source[pos] == target[pos]):
+                pos += 1
+            patch += bps_command(1, pos - start)
+            patch += target[start:pos]
+    patch += struct.pack("<I", zlib.crc32(source) & 0xFFFFFFFF)
+    patch += struct.pack("<I", zlib.crc32(target) & 0xFFFFFFFF)
+    patch += struct.pack("<I", zlib.crc32(patch) & 0xFFFFFFFF)
+    return bytes(patch)
+
+
+def create_ppf_patch(source: bytes, target: bytes, description: str = PATCH_METADATA) -> bytes:
+    if len(target) < len(source):
+        raise ValueError("PPF output cannot safely represent truncating the target ROM. Use BPS for smaller target files.")
+    if len(target) > 0xFFFFFFFF:
+        raise ValueError("PPF1 output supports offsets up to 4 GiB. Use BPS for larger target files.")
+    patch = bytearray(b"PPF10")
+    desc = description.encode("ascii", errors="replace")[:50]
+    patch += desc.ljust(50, b" ")
+    limit = len(target)
+    pos = 0
+    while pos < limit:
+        source_byte = source[pos] if pos < len(source) else None
+        if source_byte == target[pos]:
+            pos += 1
+            continue
+        start = pos
+        chunk = bytearray()
+        while pos < limit and len(chunk) < 255:
+            source_byte = source[pos] if pos < len(source) else None
+            if source_byte == target[pos]:
+                break
+            chunk.append(target[pos])
+            pos += 1
+        patch += struct.pack("<I", start)
+        patch.append(len(chunk))
+        patch += chunk
+    return bytes(patch)
+
+
+@dataclass
+class PatchSummary:
+    source_size: int
+    target_size: int
+    changed_bytes: int
+    first_difference: int | None
+    source_crc32: int
+    target_crc32: int
+
+    def text(self) -> str:
+        first = "-" if self.first_difference is None else f"0x{self.first_difference:X}"
+        return (
+            f"Source size: {self.source_size} bytes\n"
+            f"Target size: {self.target_size} bytes\n"
+            f"Changed byte positions: {self.changed_bytes}\n"
+            f"First difference: {first}\n"
+            f"Source CRC32: 0x{self.source_crc32:08X}\n"
+            f"Target CRC32: 0x{self.target_crc32:08X}"
+        )
+
+
+def summarize_patch_inputs(source: bytes, target: bytes) -> PatchSummary:
+    changed = 0
+    first: int | None = None
+    for index in range(max(len(source), len(target))):
+        source_byte = source[index] if index < len(source) else None
+        target_byte = target[index] if index < len(target) else None
+        if source_byte != target_byte:
+            changed += 1
+            if first is None:
+                first = index
+    return PatchSummary(len(source), len(target), changed, first, zlib.crc32(source) & 0xFFFFFFFF, zlib.crc32(target) & 0xFFFFFFFF)
+
+
+class PatchCreatorPanel(QWidget):
+    def __init__(self, window: "Workbench") -> None:
+        super().__init__(); self.window = window; self.source_path: Path | None = None; self.target_path: Path | None = None; self.output_path: Path | None = None
+        layout = QVBoxLayout(self)
+        form = QFormLayout(); self.source_edit = QLineEdit(); self.source_edit.setReadOnly(True); self.target_edit = QLineEdit(); self.target_edit.setReadOnly(True); self.output_edit = QLineEdit(); self.output_edit.setReadOnly(True)
+        source_row = QHBoxLayout(); source_row.addWidget(self.source_edit); self.source_button = QPushButton("Select original ROM"); self.source_button.clicked.connect(self.choose_source); source_row.addWidget(self.source_button); form.addRow("Original ROM", source_row)
+        target_row = QHBoxLayout(); target_row.addWidget(self.target_edit); self.target_button = QPushButton("Select modified ROM"); self.target_button.clicked.connect(self.choose_target); target_row.addWidget(self.target_button); form.addRow("Modified ROM", target_row)
+        output_row = QHBoxLayout(); output_row.addWidget(self.output_edit); self.output_button = QPushButton("Select output"); self.output_button.clicked.connect(self.choose_output); output_row.addWidget(self.output_button); form.addRow("Output", output_row)
+        self.format = QComboBox(); self.format.addItem("BPS", "bps"); self.format.addItem("PPF", "ppf"); self.format.addItem("BPS + PPF", "both"); self.format.currentIndexChanged.connect(self.update_default_output); form.addRow("Format", self.format)
+        self.description = QLineEdit(PATCH_METADATA); form.addRow("Description", self.description); layout.addLayout(form)
+        self.source_check = QLabel("Original ROM: not checked"); self.source_check.setWordWrap(True); layout.addWidget(self.source_check)
+        buttons = QHBoxLayout(); self.detect_button = QPushButton("Auto detect modified ROM"); self.detect_button.clicked.connect(self.detect_default_rom); self.create_button = QPushButton("Create patch"); self.create_button.clicked.connect(self.create_patch); buttons.addWidget(self.detect_button); buttons.addStretch(); buttons.addWidget(self.create_button); layout.addLayout(buttons)
+        self.warning = QLabel("BPS is recommended for distribution. PPF output uses PPF1 for broad GBA patcher compatibility. Original ROM must match Japanese or English Pokemon Emerald."); self.warning.setWordWrap(True); layout.addWidget(self.warning)
+        self.summary = QPlainTextEdit(); self.summary.setReadOnly(True); layout.addWidget(self.summary)
+        self.detect_default_rom()
+
+    def reset_loaded(self) -> None:
+        self.detect_default_rom()
+
+    def set_path_texts(self) -> None:
+        self.source_edit.setText(patch_display_path(self.window.root, self.source_path))
+        self.target_edit.setText(patch_display_path(self.window.root, self.target_path))
+        self.output_edit.setText(patch_display_path(self.window.root, self.output_path))
+
+    def detect_default_rom(self) -> None:
+        target = self.window.root / "pokeemerald.gba"
+        if target.exists():
+            self.target_path = target
+        if self.output_path is None:
+            self.update_default_output()
+        self.set_path_texts()
+
+    def choose_source(self) -> None:
+        selected, _ = QFileDialog.getOpenFileName(self, "Select original ROM", str(self.window.root), "GBA ROM (*.gba);;All files (*)")
+        if selected:
+            self.source_path = Path(selected)
+            self.set_path_texts()
+            self.update_source_check()
+
+    def choose_target(self) -> None:
+        selected, _ = QFileDialog.getOpenFileName(self, "Select modified ROM", str(self.window.root), "GBA ROM (*.gba);;All files (*)")
+        if selected:
+            self.target_path = Path(selected)
+            self.update_default_output()
+            self.set_path_texts()
+
+    def choose_output(self) -> None:
+        suffix = ".bps" if self.format.currentData() == "bps" else ".ppf"
+        selected, _ = QFileDialog.getSaveFileName(self, "Select patch output", str(self.default_output_path(suffix)), "Patch files (*.bps *.ppf);;All files (*)")
+        if selected:
+            self.output_path = Path(selected)
+            self.set_path_texts()
+
+    def default_output_path(self, suffix: str = "") -> Path:
+        base = self.target_path or (self.window.root / "pokeemerald.gba")
+        output_dir = self.window.root / "patches"
+        name = base.stem if base else "patch"
+        actual_suffix = suffix or (".bps" if self.format.currentData() == "bps" else ".ppf")
+        return output_dir / f"{name}{actual_suffix}"
+
+    def update_default_output(self) -> None:
+        data = self.format.currentData()
+        suffix = ".bps" if data in {"bps", "both"} else ".ppf"
+        self.output_path = self.default_output_path(suffix)
+        self.set_path_texts()
+
+    def validate_inputs(self) -> tuple[bytes, bytes] | None:
+        if not self.source_path or not self.source_path.exists():
+            QMessageBox.warning(self, "Patch input missing", "Select the original ROM.")
+            return None
+        if not self.target_path or not self.target_path.exists():
+            QMessageBox.warning(self, "Patch input missing", "Select the modified ROM.")
+            return None
+        if self.source_path.resolve() == self.target_path.resolve():
+            QMessageBox.warning(self, "Patch input invalid", "Original ROM and modified ROM must be different files.")
+            return None
+        source = self.source_path.read_bytes()
+        known, fingerprint = match_known_emerald_base_rom(source)
+        if not known:
+            message = "Original ROM is not an allowed Japanese or English Pokemon Emerald ROM.\n\nSelected file:\n"
+            message += fingerprint_text(fingerprint) + "\n\n" + known_base_rom_list_text()
+            self.source_check.setText("Original ROM: rejected\n" + fingerprint_text(fingerprint))
+            self.summary.setPlainText(message)
+            QMessageBox.warning(self, "Original ROM rejected", message)
+            return None
+        self.source_check.setText(f"Original ROM: OK\n{known.label}\n{fingerprint_text(fingerprint)}")
+        return source, self.target_path.read_bytes()
+
+    def update_source_check(self) -> None:
+        if not self.source_path or not self.source_path.exists():
+            self.source_check.setText("Original ROM: not checked")
+            return
+        try:
+            data = self.source_path.read_bytes()
+        except OSError as error:
+            self.source_check.setText(f"Original ROM: read failed\n{error}")
+            return
+        known, fingerprint = match_known_emerald_base_rom(data)
+        if known:
+            self.source_check.setText(f"Original ROM: OK\n{known.label}\n{fingerprint_text(fingerprint)}")
+        else:
+            self.source_check.setText("Original ROM: rejected\n" + fingerprint_text(fingerprint))
+
+    def create_patch(self) -> None:
+        inputs = self.validate_inputs()
+        if inputs is None:
+            return
+        source, target = inputs
+        summary = summarize_patch_inputs(source, target)
+        if summary.changed_bytes == 0:
+            QMessageBox.information(self, "No differences", "The selected ROM files are identical.")
+            self.summary.setPlainText(summary.text())
+            return
+        data = self.format.currentData()
+        outputs: list[tuple[Path, bytes]] = []
+        description = self.description.text().strip() or PATCH_METADATA
+        try:
+            if data in {"bps", "both"}:
+                outputs.append((self.output_path if data == "bps" and self.output_path else self.default_output_path(".bps"), create_bps_patch(source, target, description)))
+            if data in {"ppf", "both"}:
+                outputs.append((self.output_path if data == "ppf" and self.output_path else self.default_output_path(".ppf"), create_ppf_patch(source, target, description)))
+        except ValueError as error:
+            QMessageBox.warning(self, "Patch creation failed", str(error))
+            return
+        for path, patch in outputs:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(patch)
+        lines = [summary.text(), "", "Created patches:"]
+        lines.extend(f"- {patch_display_path(self.window.root, path)} ({len(patch)} bytes)" for path, patch in outputs)
+        self.summary.setPlainText("\n".join(lines))
+        self.window.status(f"Created {len(outputs)} patch file(s)")
 
 
 @dataclass
@@ -4139,7 +4807,7 @@ class PokemonStudioPanel(RecordStudioBase):
         spin = QSpinBox(); spin.setRange(0, 255); spin.valueChanged.connect(lambda: None); return spin
 
     def build(self) -> None:
-        layout = QVBoxLayout(self); split = QSplitter(Qt.Orientation.Horizontal); left = QWidget(); left_layout = QVBoxLayout(left); left_layout.addWidget(self.search); left_layout.addWidget(self.table); split.addWidget(left)
+        layout = QVBoxLayout(self); split = QSplitter(Qt.Orientation.Horizontal); left = QWidget(); left_layout = QVBoxLayout(left); top = QHBoxLayout(); top.addWidget(self.search); add_original = QPushButton("Add original"); add_original.clicked.connect(self.create_original_species); duplicate = QPushButton("Duplicate"); duplicate.clicked.connect(self.duplicate_current_species); top.addWidget(add_original); top.addWidget(duplicate); left_layout.addLayout(top); left_layout.addWidget(self.table); split.addWidget(left)
         right = QWidget(); right_layout = QVBoxLayout(right); card = QFrame(); card.setFrameShape(QFrame.Shape.StyledPanel); card_layout = QVBoxLayout(card); self.summary_name.setStyleSheet("font-size: 24px; font-weight: 700;"); card_layout.addWidget(self.summary_name); card_layout.addWidget(self.summary_meta); card_layout.addWidget(self.summary_total); right_layout.addWidget(card)
         tabs = QTabWidget(); self.tabs = tabs
         basic = QWidget(); basic_form = QFormLayout(basic); basic_form.addRow("名前", self.name); basic_form.addRow("分類", self.category); basic_form.addRow("タイプ1", self.type1); basic_form.addRow("タイプ2", self.type2); basic_form.addRow("高さ (dm)", self.height); basic_form.addRow("重さ (hg)", self.weight); tabs.addTab(basic, "基本")
@@ -4369,6 +5037,228 @@ class PokemonStudioPanel(RecordStudioBase):
     def jump_move(self, item: QTableWidgetItem) -> None:
         key = self.learnset.item(item.row(), 1).data(Qt.ItemDataRole.UserRole); self.window.open_move(key)
 
+    def create_original_species(self) -> None:
+        raw_id, ok = QInputDialog.getText(self, "Add original Pokemon", "Internal ID (SPECIES_ optional):")
+        if not ok or not raw_id.strip():
+            return
+        try:
+            key = prefixed_constant(raw_id, "SPECIES_")
+        except ValueError as error:
+            QMessageBox.warning(self, "Invalid ID", str(error)); return
+        default_name = key.removeprefix("SPECIES_").replace("_", " ").title()
+        display_name, ok = QInputDialog.getText(self, "Add original Pokemon", "Display name:", text=default_name)
+        if not ok:
+            return
+        try:
+            self.write_original_species(key, display_name.strip() or default_name)
+        except (OSError, RuntimeError) as error:
+            QMessageBox.critical(self, "Add original Pokemon failed", str(error)); return
+        self.load(); self.select_key(key); self.window.status(f"Added original Pokemon: {key}")
+
+    def duplicate_current_species(self) -> None:
+        if not self.current:
+            QMessageBox.information(self, "Duplicate Pokemon", "Select an existing species first.")
+            return
+        source_record = self.current
+        raw_id, ok = QInputDialog.getText(self, "Duplicate Pokemon", f"New internal ID copied from {source_record.key} (SPECIES_ optional):")
+        if not ok or not raw_id.strip():
+            return
+        try:
+            key = prefixed_constant(raw_id, "SPECIES_")
+        except ValueError as error:
+            QMessageBox.warning(self, "Invalid ID", str(error)); return
+        default_name = key.removeprefix("SPECIES_").replace("_", " ").title()
+        display_name, ok = QInputDialog.getText(self, "Duplicate Pokemon", "Display name:", text=default_name)
+        if not ok:
+            return
+        learnset_plan = self.species_learnset_duplicate_plan(source_record, key)
+        changed = [
+            self.window.root / "include/constants/species.h",
+            self.window.root / "src/data/pokemon/species_info.h",
+            *[path for _field, _old, _new, path in learnset_plan],
+        ]
+        unique_changed = []
+        for path in changed:
+            if path not in unique_changed:
+                unique_changed.append(path)
+        details = "\n".join(f"- {rel(self.window.root, path)}" for path in unique_changed)
+        learnset_details = "\n".join(f"- {field}: {old} -> {new}" for field, old, new, _path in learnset_plan) or "- no independent learnset arrays found; existing pointers will be retained"
+        message = (
+            f"Duplicate {source_record.key} as {key}.\n\n"
+            "Changed files:\n"
+            f"{details}\n\n"
+            "Learnset handling:\n"
+            f"{learnset_details}\n\n"
+            "Backups (.bak) will be created before writing. Graphics, cry, evolution, category, and description references are copied from the source species. National Dex is set to NATIONAL_DEX_NONE."
+        )
+        if QMessageBox.question(self, "Confirm Pokemon duplicate", message) != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            self.write_duplicate_species(source_record, key, display_name.strip() or default_name, learnset_plan)
+        except (OSError, RuntimeError) as error:
+            QMessageBox.critical(self, "Duplicate Pokemon failed", str(error)); return
+        self.load(); self.select_key(key); self.window.status(f"Duplicated Pokemon: {source_record.key} -> {key}")
+
+    def write_original_species(self, key: str, display_name: str) -> None:
+        constants_path = self.window.root / "include/constants/species.h"
+        info_path = self.window.root / "src/data/pokemon/species_info.h"
+        constants_source = read_utf8(constants_path)
+        info_source = read_utf8(info_path)
+        if re.search(rf"\b{re.escape(key)}\b", constants_source) or re.search(rf"\b{re.escape(key)}\b", info_source):
+            raise RuntimeError(f"{key} already exists.")
+        constants_match = re.search(r"(?m)^(\s*)SPECIES_CUSTOM_END,", constants_source)
+        if not constants_match:
+            raise RuntimeError("SPECIES_CUSTOM_END was not found in include/constants/species.h.")
+        constants_newline = source_newline(constants_source)
+        constants_insert = f"{constants_match.group(1)}{key},{constants_newline}"
+        new_constants = constants_source[:constants_match.start()] + constants_insert + constants_source[constants_match.start():]
+        info_match = re.search(r"\n\};\s*\n\s*const struct EggData", info_source)
+        if not info_match:
+            raise RuntimeError("Could not find the end of gSpeciesInfo in src/data/pokemon/species_info.h.")
+        info_newline = source_newline(info_source)
+        new_info = info_source[:info_match.start()] + self.original_species_block(key, display_name, info_newline) + info_source[info_match.start():]
+        write_with_backup(constants_path, new_constants)
+        write_with_backup(info_path, new_info)
+
+    def species_learnset_duplicate_plan(self, source_record: SourceRecord, key: str) -> list[tuple[str, str, str, Path]]:
+        base = constant_suffix_pascal(key, "SPECIES_")
+        suffixes = {
+            "levelUpLearnset": "LevelUpLearnset",
+            "eggMoveLearnset": "EggMoveLearnset",
+            "teachableLearnset": "TeachableLearnset",
+        }
+        plan: list[tuple[str, str, str, Path]] = []
+        for field_name, suffix in suffixes.items():
+            old_pointer = source_record.values.get(field_name, "").strip()
+            if not old_pointer or old_pointer in {"NULL", "0", "sNoneLevelUpLearnset", "sNoneEggMoveLearnset", "sNoneTeachableLearnset"}:
+                continue
+            for path in self.learnset_files(field_name):
+                if path.exists() and self.find_learnset_array(read_utf8(path), old_pointer):
+                    plan.append((field_name, old_pointer, "s" + base + suffix, path))
+                    break
+        return plan
+
+    @staticmethod
+    def find_learnset_array(source: str, pointer: str) -> re.Match[str] | None:
+        pattern = re.compile(rf"(?ms)^[^\n]*\b{re.escape(pointer)}\[\]\s*=\s*\{{.*?^\s*\}};")
+        return pattern.search(source)
+
+    def write_duplicate_species(self, source_record: SourceRecord, key: str, display_name: str, learnset_plan: list[tuple[str, str, str, Path]]) -> None:
+        constants_path = self.window.root / "include/constants/species.h"
+        info_path = self.window.root / "src/data/pokemon/species_info.h"
+        constants_source = read_utf8(constants_path)
+        info_source = read_utf8(info_path)
+        if re.search(rf"\b{re.escape(key)}\b", constants_source) or re.search(rf"\b{re.escape(key)}\b", info_source) or any(record.key == key for record in self.records):
+            raise RuntimeError(f"{key} already exists.")
+        constants_match = re.search(r"(?m)^(\s*)SPECIES_CUSTOM_END,", constants_source)
+        if not constants_match:
+            raise RuntimeError("SPECIES_CUSTOM_END was not found in include/constants/species.h.")
+        constants_newline = source_newline(constants_source)
+        constants_insert = f"{constants_match.group(1)}{key},{constants_newline}"
+        new_constants = constants_source[:constants_match.start()] + constants_insert + constants_source[constants_match.start():]
+        new_sources: dict[Path, str] = {}
+        pointer_replacements: dict[str, str] = {}
+        for field_name, old_pointer, new_pointer, path in learnset_plan:
+            source = new_sources.get(path, read_utf8(path))
+            if re.search(rf"\b{re.escape(new_pointer)}\[\]\s*=", source):
+                pointer_replacements[field_name] = new_pointer
+                new_sources[path] = source
+                continue
+            match = self.find_learnset_array(source, old_pointer)
+            if not match:
+                continue
+            newline = source_newline(source)
+            copied = match.group(0).replace(old_pointer, new_pointer, 1)
+            source = source[:match.end()] + newline + copied + source[match.end():]
+            new_sources[path] = source
+            pointer_replacements[field_name] = new_pointer
+        info_match = re.search(r"\n\};\s*\n\s*const struct EggData", info_source)
+        if not info_match:
+            raise RuntimeError("Could not find the end of gSpeciesInfo in src/data/pokemon/species_info.h.")
+        duplicate_block = self.duplicate_species_block(source_record, key, display_name, source_newline(info_source), pointer_replacements)
+        new_info = info_source[:info_match.start()] + duplicate_block + info_source[info_match.start():]
+        assert_no_concatenated_designators(info_path, new_info, self.window.root)
+        write_with_backup(constants_path, new_constants)
+        write_with_backup(info_path, new_info)
+        for path, source in new_sources.items():
+            write_with_backup(path, source)
+
+    @staticmethod
+    def duplicate_species_block(source_record: SourceRecord, key: str, display_name: str, newline: str, pointer_replacements: dict[str, str]) -> str:
+        block = re.sub(r"\[\s*SPECIES_[A-Za-z0-9_]+\s*\]", f"[{key}]", source_record.block, count=1)
+        values = {
+            "speciesName": display_name_with_jpn(display_name),
+            "natDexNum": "NATIONAL_DEX_NONE",
+            **pointer_replacements,
+        }
+        temp = SourceRecord(source_record.path, key, 0, len(block), block, dict(source_record.values))
+        block = replace_record_fields(temp, values, {"speciesName"}, {"speciesName": "_"})
+        block = ensure_designated_initializer_commas(block).rstrip()
+        if block.endswith("}"):
+            block += ","
+        lines = block.splitlines()
+        if lines and lines[0].startswith("["):
+            lines[0] = "    " + lines[0]
+        return newline + f"    /* Expansion Studio duplicated from {source_record.key} */" + newline + newline.join(lines) + newline
+
+    @staticmethod
+    def original_species_block(key: str, display_name: str, newline: str) -> str:
+        name = quote_c_text(display_name_with_jpn(display_name))
+        description = quote_c_text("{JPN}Newly discovered Pokemon.")
+        lines = [
+            "",
+            "    /* Expansion Studio custom species */",
+            f"    [{key}] =",
+            "    {",
+            "        .baseHP        = 50,",
+            "        .baseAttack    = 50,",
+            "        .baseDefense   = 50,",
+            "        .baseSpeed     = 50,",
+            "        .baseSpAttack  = 50,",
+            "        .baseSpDefense = 50,",
+            "        .types = MON_TYPES(TYPE_NORMAL),",
+            "        .catchRate = 45,",
+            "        .expYield = 64,",
+            "        .evYield_HP = 1,",
+            "        .genderRatio = PERCENT_FEMALE(50),",
+            "        .eggCycles = 20,",
+            "        .friendship = STANDARD_FRIENDSHIP,",
+            "        .growthRate = GROWTH_MEDIUM_FAST,",
+            "        .eggGroups = MON_EGG_GROUPS(EGG_GROUP_FIELD),",
+            "        .abilities = { ABILITY_NONE, ABILITY_NONE, ABILITY_NONE },",
+            "        .bodyColor = BODY_COLOR_BLACK,",
+            f"        .speciesName = _({name}),",
+            "        .cryId = CRY_NONE,",
+            "        .natDexNum = NATIONAL_DEX_NONE,",
+            "        .categoryName = _(\"Custom\"),",
+            "        .height = 10,",
+            "        .weight = 100,",
+            f"        .description = COMPOUND_STRING({description}),",
+            "        .pokemonScale = 256,",
+            "        .pokemonOffset = 0,",
+            "        .trainerScale = 256,",
+            "        .trainerOffset = 0,",
+            "        .frontPic = gMonFrontPic_CircledQuestionMark,",
+            "        .frontPicSize = MON_COORDS_SIZE(40, 40),",
+            "        .frontPicYOffset = 12,",
+            "        .frontAnimFrames = sAnims_TwoFramePlaceHolder,",
+            "        .frontAnimId = ANIM_V_SQUISH_AND_BOUNCE,",
+            "        .backPic = gMonBackPic_CircledQuestionMark,",
+            "        .backPicSize = MON_COORDS_SIZE(40, 40),",
+            "        .backPicYOffset = 12,",
+            "        .backAnimId = BACK_ANIM_NONE,",
+            "        .palette = gMonPalette_CircledQuestionMark,",
+            "        .shinyPalette = gMonShinyPalette_CircledQuestionMark,",
+            "        .iconSprite = gMonIcon_QuestionMark,",
+            "        .iconPalIndex = 0,",
+            "        FOOTPRINT(QuestionMark)",
+            "        .levelUpLearnset = sNoneLevelUpLearnset,",
+            "        .teachableLearnset = sNoneTeachableLearnset,",
+            "        .eggMoveLearnset = sNoneEggMoveLearnset,",
+            "    },",
+        ]
+        return newline + newline.join(lines) + newline
+
 
 class MoveStudioPanel(RecordStudioBase):
     FLAG_LABELS = {"makesContact": "接触", "punchingMove": "パンチ", "soundMove": "音技", "windMove": "風技", "bitingMove": "かみつき", "pulseMove": "波動", "slicingMove": "切断", "healingMove": "回復", "ballisticMove": "弾・爆弾", "powderMove": "粉"}
@@ -4381,7 +5271,7 @@ class MoveStudioPanel(RecordStudioBase):
         for internal, label in TYPE_LABELS.items(): self.type.addItem(label, internal)
         for internal, label in CATEGORY_LABELS.items(): self.category.addItem(label, internal)
         for spin, low, high in ((self.power, 0, 511), (self.accuracy, 0, 100), (self.pp, 0, 99), (self.priority, -7, 7), (self.critical, 0, 3)): spin.setRange(low, high)
-        layout = QVBoxLayout(self); split = QSplitter(Qt.Orientation.Horizontal); left = QWidget(); left_layout = QVBoxLayout(left); left_layout.addWidget(self.search); left_layout.addWidget(self.table); split.addWidget(left)
+        layout = QVBoxLayout(self); split = QSplitter(Qt.Orientation.Horizontal); left = QWidget(); left_layout = QVBoxLayout(left); top = QHBoxLayout(); top.addWidget(self.search); add_original = QPushButton("Add original"); add_original.clicked.connect(self.create_original_move); duplicate = QPushButton("Duplicate"); duplicate.clicked.connect(self.duplicate_current_move); top.addWidget(add_original); top.addWidget(duplicate); left_layout.addLayout(top); left_layout.addWidget(self.table); split.addWidget(left)
         right = QWidget(); right_layout = QVBoxLayout(right); card = QFrame(); card.setFrameShape(QFrame.Shape.StyledPanel); card_layout = QVBoxLayout(card); self.summary_name.setStyleSheet("font-size: 24px; font-weight: 700;"); card_layout.addWidget(self.summary_name); card_layout.addWidget(self.summary_meta); card_layout.addWidget(self.effect_summary); right_layout.addWidget(card)
         tabs = QTabWidget(); basic = QWidget(); form = QFormLayout(basic); form.addRow("名前", self.name); form.addRow("タイプ", self.type); form.addRow("分類", self.category); form.addRow("威力", self.power); form.addRow("命中", self.accuracy); form.addRow("PP", self.pp); form.addRow("優先度", self.priority); form.addRow("効果", self.effect); form.addRow("対象", self.target); form.addRow("説明", self.description); tabs.addTab(basic, "基本")
         flags = QWidget(); flags_layout = QVBoxLayout(flags); flags_layout.addWidget(QLabel("急所ランク")); flags_layout.addWidget(self.critical)
@@ -4517,6 +5407,163 @@ class MoveStudioPanel(RecordStudioBase):
                     self.references.addItem(f"{rel(self.window.root, path)}:{number}  {line.strip()[:120]}"); found += 1
                     if found >= 300: self.references.addItem("… 参照が多いため 300 件で省略"); return
 
+    def create_original_move(self) -> None:
+        raw_id, ok = QInputDialog.getText(self, "Add original move", "Internal ID (MOVE_ optional):")
+        if not ok or not raw_id.strip():
+            return
+        try:
+            key = prefixed_constant(raw_id, "MOVE_")
+        except ValueError as error:
+            QMessageBox.warning(self, "Invalid ID", str(error)); return
+        default_name = key.removeprefix("MOVE_").replace("_", " ").title()
+        display_name, ok = QInputDialog.getText(self, "Add original move", "Display name:", text=default_name)
+        if not ok:
+            return
+        try:
+            self.write_original_move(key, display_name.strip() or default_name)
+        except (OSError, RuntimeError) as error:
+            QMessageBox.critical(self, "Add original move failed", str(error)); return
+        self.load(); self.select_key(key); self.window.status(f"Added original move: {key}")
+
+    def duplicate_current_move(self) -> None:
+        if not self.current:
+            QMessageBox.information(self, "Duplicate move", "Select an existing move first.")
+            return
+        source_record = self.current
+        raw_id, ok = QInputDialog.getText(self, "Duplicate move", f"New internal ID copied from {source_record.key} (MOVE_ optional):")
+        if not ok or not raw_id.strip():
+            return
+        try:
+            key = prefixed_constant(raw_id, "MOVE_")
+        except ValueError as error:
+            QMessageBox.warning(self, "Invalid ID", str(error)); return
+        default_name = key.removeprefix("MOVE_").replace("_", " ").title()
+        display_name, ok = QInputDialog.getText(self, "Duplicate move", "Display name:", text=default_name)
+        if not ok:
+            return
+        changed = [
+            self.window.root / "include/constants/moves.h",
+            self.window.root / "src/data/moves_info.h",
+        ]
+        details = "\n".join(f"- {rel(self.window.root, path)}" for path in changed)
+        message = (
+            f"Duplicate {source_record.key} as {key}.\n\n"
+            "Changed files:\n"
+            f"{details}\n\n"
+            "Backups (.bak) will be created before writing. The source move's effect and battle animation are reused."
+        )
+        if QMessageBox.question(self, "Confirm move duplicate", message) != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            self.write_duplicate_move(source_record, key, display_name.strip() or default_name)
+        except (OSError, RuntimeError) as error:
+            QMessageBox.critical(self, "Duplicate move failed", str(error)); return
+        self.load(); self.select_key(key); self.window.status(f"Duplicated move: {source_record.key} -> {key}")
+
+    def write_original_move(self, key: str, display_name: str) -> None:
+        constants_path = self.window.root / "include/constants/moves.h"
+        info_path = self.window.root / "src/data/moves_info.h"
+        constants_source = read_utf8(constants_path)
+        info_source = read_utf8(info_path)
+        if re.search(rf"\b{re.escape(key)}\b", constants_source) or re.search(rf"\b{re.escape(key)}\b", info_source):
+            raise RuntimeError(f"{key} already exists.")
+        constants_with_markers = self.ensure_move_custom_range(constants_source)
+        marker = re.search(r"(?m)^(\s*)MOVE_CUSTOM_END,", constants_with_markers)
+        if not marker:
+            raise RuntimeError("MOVE_CUSTOM_END was not found in include/constants/moves.h.")
+        constants_newline = source_newline(constants_with_markers)
+        constants_insert = f"{marker.group(1)}{key},{constants_newline}"
+        new_constants = constants_with_markers[:marker.start()] + constants_insert + constants_with_markers[marker.start():]
+        new_info = insert_before_array_end(info_source, self.original_move_block(key, display_name, source_newline(info_source)))
+        write_with_backup(constants_path, new_constants)
+        write_with_backup(info_path, new_info)
+
+    def write_duplicate_move(self, source_record: SourceRecord, key: str, display_name: str) -> None:
+        constants_path = self.window.root / "include/constants/moves.h"
+        info_path = self.window.root / "src/data/moves_info.h"
+        constants_source = read_utf8(constants_path)
+        info_source = read_utf8(info_path)
+        if re.search(rf"\b{re.escape(key)}\b", constants_source) or re.search(rf"\b{re.escape(key)}\b", info_source):
+            raise RuntimeError(f"{key} already exists.")
+        constants_with_markers = self.ensure_move_custom_range(constants_source)
+        marker = re.search(r"(?m)^(\s*)MOVE_CUSTOM_END,", constants_with_markers)
+        if not marker:
+            raise RuntimeError("MOVE_CUSTOM_END was not found in include/constants/moves.h.")
+        constants_newline = source_newline(constants_with_markers)
+        constants_insert = f"{marker.group(1)}{key},{constants_newline}"
+        new_constants = constants_with_markers[:marker.start()] + constants_insert + constants_with_markers[marker.start():]
+        newline = source_newline(info_source)
+        duplicate_block = self.duplicate_move_block(source_record, key, display_name, newline)
+        new_info = insert_before_array_end(info_source, duplicate_block)
+        assert_no_concatenated_designators(info_path, new_info, self.window.root)
+        write_with_backup(constants_path, new_constants)
+        write_with_backup(info_path, new_info)
+
+    @staticmethod
+    def duplicate_move_block(source_record: SourceRecord, key: str, display_name: str, newline: str) -> str:
+        block = re.sub(r"\[\s*MOVE_[A-Za-z0-9_]+\s*\]", f"[{key}]", source_record.block, count=1)
+        temp = SourceRecord(source_record.path, key, 0, len(block), block, dict(source_record.values))
+        block = replace_record_fields(
+            temp,
+            {"name": display_name_with_jpn(display_name)},
+            {"name"},
+            {"name": "COMPOUND_STRING"},
+        )
+        block = ensure_designated_initializer_commas(block).rstrip()
+        if block.endswith("}"):
+            block += ","
+        lines = block.splitlines()
+        if lines and lines[0].startswith("["):
+            lines[0] = "    " + lines[0]
+        return newline + f"    /* Expansion Studio duplicated from {source_record.key} */" + newline + newline.join(lines) + newline
+
+    @staticmethod
+    def ensure_move_custom_range(source: str) -> str:
+        if "MOVE_CUSTOM_END" in source:
+            return source.replace("MOVE_CUSTOM_START = MOVES_COUNT_DYNAMAX,", "MOVE_CUSTOM_START = MOVES_COUNT_DYNAMAX - 1,")
+        newline = source_newline(source)
+        old = (
+            f"    LAST_MAX_MOVE = MOVE_G_MAX_RAPID_FLOW,{newline}"
+            f"    MOVES_COUNT_DYNAMAX,{newline}"
+            f"    MOVES_COUNT_ALL = MOVES_COUNT_DYNAMAX,{newline}"
+        )
+        new = (
+            f"    LAST_MAX_MOVE = MOVE_G_MAX_RAPID_FLOW,{newline}"
+            f"    MOVES_COUNT_DYNAMAX,{newline}"
+            f"{newline}"
+            f"    MOVE_CUSTOM_START = MOVES_COUNT_DYNAMAX - 1,{newline}"
+            f"    // Add custom moves between here and MOVE_CUSTOM_END{newline}"
+            f"    MOVE_CUSTOM_END,{newline}"
+            f"    MOVES_COUNT_ALL = MOVE_CUSTOM_END,{newline}"
+        )
+        if old not in source:
+            raise RuntimeError("Could not find the MOVES_COUNT_DYNAMAX / MOVES_COUNT_ALL block.")
+        return source.replace(old, new, 1)
+
+    @staticmethod
+    def original_move_block(key: str, display_name: str, newline: str) -> str:
+        name = quote_c_text(display_name_with_jpn(display_name))
+        description = quote_c_text("{JPN}Newly created move.")
+        lines = [
+            "",
+            "    /* Expansion Studio custom move */",
+            f"    [{key}] =",
+            "    {",
+            f"        .name = COMPOUND_STRING({name}),",
+            f"        .description = COMPOUND_STRING({description}),",
+            "        .effect = EFFECT_HIT,",
+            "        .power = 40,",
+            "        .type = TYPE_NORMAL,",
+            "        .accuracy = 100,",
+            "        .pp = 35,",
+            "        .target = TARGET_SELECTED,",
+            "        .priority = 0,",
+            "        .category = DAMAGE_CATEGORY_PHYSICAL,",
+            "        .battleAnimScript = gBattleAnimMove_Tackle,",
+            "    },",
+        ]
+        return newline + newline.join(lines) + newline
+
 
 FRONTIER_MON_FIELDS = [
     "nickname", "species", "moves", "heldItem", "ev", "iv", "ability", "lvl", "ball", "friendship",
@@ -4609,6 +5656,7 @@ class TrainerPartyMonBlock:
 
 class MapEncounterPanel(QWidget):
     """Map weather and wild encounter JSON editor."""
+    NULL_CHOICE_LABEL = "null(指定なし)"
     RANDOM_FRONTIER_WEATHERS = [
         "WEATHER_NONE",
         "WEATHER_SUNNY_CLOUDS",
@@ -4761,9 +5809,9 @@ class MapEncounterPanel(QWidget):
     def populate_static_combos(self) -> None:
         self.fill_combo(self.map_weather, self.weather_names)
         pool_choices = self.weather_pool_choices()
-        self.fill_combo(self.add_weather, pool_choices)
+        self.fill_combo(self.add_weather, [""] + pool_choices, {"": self.NULL_CHOICE_LABEL})
         self.fill_combo(self.area_select, [str(field.get("type")) for field in self.field_specs])
-        self.fill_combo(self.time_add, list(self.time_labels.keys()), self.time_labels)
+        self.fill_combo(self.time_add, [""] + list(self.time_labels.keys()), {"": self.NULL_CHOICE_LABEL, **self.time_labels})
         self.refresh_species_combo()
 
     def fill_combo(self, combo: QComboBox, keys: list[str], labels: dict[str, str] | None = None) -> None:
@@ -4771,7 +5819,10 @@ class MapEncounterPanel(QWidget):
         combo.blockSignals(True); combo.clear()
         for key in keys:
             label = labels.get(key, key)
-            combo.addItem(f"{label} [{key}]" if label != key else key, key)
+            if key == "":
+                combo.addItem(label or self.NULL_CHOICE_LABEL, key)
+            else:
+                combo.addItem(f"{label} [{key}]" if label != key else key, key)
         combo.blockSignals(False)
 
     def weather_pool_choices(self) -> list[str]:
@@ -4796,11 +5847,12 @@ class MapEncounterPanel(QWidget):
             suffix = "_" + label
             if base_label.endswith(suffix):
                 return base_label[:-len(suffix)], time
-        return base_label, self.time_fallback
+        return base_label, ""
 
     def encounter_display(self, encounter: dict[str, object]) -> str:
         shared, time = self.encounter_time_info(encounter)
-        return f"{self.time_labels.get(time, time)} / {encounter.get('base_label', shared)}"
+        label = self.time_labels.get(time, time) if time else self.NULL_CHOICE_LABEL
+        return f"{label} / {encounter.get('base_label', shared)}"
 
     def refresh_maps(self) -> None:
         query = self.map_search.text().casefold() if hasattr(self, "map_search") else ""
@@ -5074,7 +6126,7 @@ class MapEncounterPanel(QWidget):
             return
         target_time = self.combo_value(self.time_add)
         shared, _current_time = self.encounter_time_info(self.current_encounter)
-        target_label = shared if target_time == self.time_fallback else f"{shared}_{self.time_labels.get(target_time, target_time)}"
+        target_label = shared if not target_time or target_time == self.time_fallback else f"{shared}_{self.time_labels.get(target_time, target_time)}"
         map_id = str(self.current_encounter.get("map", ""))
         for encounter in self.encounters:
             if encounter.get("map") == map_id and encounter.get("base_label") == target_label:
@@ -5145,7 +6197,7 @@ class BattleFrontierPanel(QWidget):
         self.general_trainer_path = Path(); self.general_trainer_source = ""; self.general_trainers: list[GeneralTrainerBlock] = []; self.general_trainer_states: dict[str, str] = {}; self.current_general_trainer: GeneralTrainerBlock | None = None
         self.factory_path = Path(); self.factory_source = ""; self.factory_ranges: list[FactoryRangeRecord] = []; self.factory_ivs: list[FactoryIvRecord] = []; self.range_states: dict[int, tuple[str, str]] = {}; self.iv_states: dict[int, tuple[int, int]] = {}
         self.species_names: dict[str, str] = {}; self.move_names: dict[str, str] = {}; self.move_metadata: dict[str, MoveMetadata] = {}; self.item_names: dict[str, str] = {}; self.ability_names: dict[str, str] = {}
-        self.species_abilities: dict[str, list[str]] = {}; self.item_pockets: dict[str, str] = {}; self.item_hold_effects: dict[str, str] = {}
+        self.species_abilities: dict[str, list[str]] = {}; self.species_dex_numbers: dict[str, int] = {}; self.species_types: dict[str, tuple[str, str]] = {}; self.item_pockets: dict[str, str] = {}; self.item_hold_effects: dict[str, str] = {}
         self.species_values: dict[str, int] = {}; self.move_values: dict[str, int] = {}; self.item_values: dict[str, int] = {}; self.frontier_values: dict[str, int] = {}; self.frontier_by_value: dict[int, str] = {}
         self.species_learnsets: dict[str, set[str]] = {}; self.species_move_sources: dict[str, dict[str, set[str]]] = {}; self.mon_usage_counts: dict[str, int] = {}; self.factory_usage: set[str] = set()
         self.build()
@@ -5161,11 +6213,15 @@ class BattleFrontierPanel(QWidget):
 
     def build_mons_tab(self) -> None:
         page = QWidget(); layout = QVBoxLayout(page); split = QSplitter(Qt.Orientation.Horizontal)
-        left = QWidget(); left_layout = QVBoxLayout(left); top = QHBoxLayout(); self.mon_search = QLineEdit(); self.mon_search.setPlaceholderText("FRONTIER_MON / species / item"); self.mon_search.textChanged.connect(self.refresh_mons); top.addWidget(self.mon_search)
+        left = QWidget(); left_layout = QVBoxLayout(left); top = QHBoxLayout(); self.mon_search = QLineEdit(); self.mon_search.setPlaceholderText("FRONTIER_MON / species / item / type"); self.mon_search.textChanged.connect(self.refresh_mons); top.addWidget(self.mon_search)
         left.setMinimumWidth(LIST_PANEL_MIN_WIDTH)
+        self.mon_sort = QComboBox()
+        for label, value in (("Dex order", "dex"), ("Generation", "generation"), ("Type", "type"), ("Frontier ID", "frontier"), ("Species name", "species")):
+            self.mon_sort.addItem(label, value)
+        self.mon_sort.currentIndexChanged.connect(self.refresh_mons); stabilize_combo(self.mon_sort, 14); top.addWidget(self.mon_sort)
         self.mon_unused_only = QCheckBox("usage 0"); self.mon_unused_only.stateChanged.connect(self.refresh_mons); top.addWidget(self.mon_unused_only); left_layout.addLayout(top)
-        self.mon_table = QTableWidget(0, 12); self.mon_table.setHorizontalHeaderLabels(["No.", "Frontier ID", "Species", "Item", "Use", "Factory", "Mega", "Z", "DMax", "Tera", "Shiny", "Unused"]); self.mon_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows); self.mon_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers); self.mon_table.itemSelectionChanged.connect(self.select_mon); left_layout.addWidget(self.mon_table); split.addWidget(left)
-        self.set_columns(self.mon_table, [62, 210, 170, 150, 58, 70, 54, 44, 58, 58, 58, 68])
+        self.mon_table = QTableWidget(0, 14); self.mon_table.setHorizontalHeaderLabels(["Dex", "Gen", "Frontier ID", "Species", "Type", "Item", "Use", "Factory", "Mega", "Z", "DMax", "Tera", "Shiny", "Unused"]); self.mon_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows); self.mon_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers); self.mon_table.itemSelectionChanged.connect(self.select_mon); left_layout.addWidget(self.mon_table); split.addWidget(left)
+        self.set_columns(self.mon_table, [68, 54, 210, 170, 130, 150, 58, 70, 54, 44, 58, 58, 58, 68])
         right = QWidget(); right.setMinimumWidth(DETAIL_PANEL_MIN_WIDTH); right_layout = QVBoxLayout(right); self.mon_summary = QLabel(); self.mon_summary.setStyleSheet("font-size: 18px; font-weight: 700;"); self.mon_summary.setMinimumHeight(34); right_layout.addWidget(self.mon_summary)
         form_tabs = QTabWidget(); basic = QWidget(); form = QFormLayout(basic)
         self.mon_species = self.combo(); self.mon_nickname = QLineEdit(); self.mon_item_category = QComboBox(); self.mon_item_filter = QLineEdit(); self.mon_item = self.combo(); self.mon_ability = self.combo(); self.mon_nature = self.combo(); self.mon_ball = self.combo(); self.mon_gender = self.combo(); self.mon_level = self.spin(0, 100); self.mon_friendship = self.spin(0, 255)
@@ -5198,7 +6254,28 @@ class BattleFrontierPanel(QWidget):
         gimmick = QWidget(); gimmick_form = QFormLayout(gimmick); self.mon_tera = self.combo(); self.mon_dmax = QCheckBox("Use Dynamax"); self.mon_dmax_level = self.spin(0, 10); self.mon_gmax = QCheckBox("Gigantamax factor"); self.mon_shiny = QCheckBox("Shiny"); self.mon_tags = QLineEdit()
         for label, control in (("Tera type", self.mon_tera), ("Dynamax", self.mon_dmax), ("Dynamax level", self.mon_dmax_level), ("Gigantamax", self.mon_gmax), ("Shiny", self.mon_shiny), ("Tags", self.mon_tags)): gimmick_form.addRow(label, control)
         form_tabs.addTab(gimmick, "Gimmick")
-        right_layout.addWidget(form_tabs); buttons = QHBoxLayout(); add = QPushButton("Add"); add.clicked.connect(self.add_frontier_mon); delete = QPushButton("Delete"); delete.clicked.connect(self.delete_frontier_mon); diff = QPushButton("Diff"); diff.clicked.connect(self.show_mon_diff); save = QPushButton("Save pool"); save.clicked.connect(self.save_mons); buttons.addWidget(add); buttons.addWidget(delete); buttons.addStretch(); buttons.addWidget(diff); buttons.addWidget(save); right_layout.addLayout(buttons); split.addWidget(right); stabilize_splitter(split, 1, 1); split.setSizes([720, 760]); layout.addWidget(split); self.tabs.addTab(page, "Pokemon pool")
+        right_layout.addWidget(form_tabs)
+        factory_box = QGroupBox("Battle Factory rental")
+        factory_form = QFormLayout(factory_box)
+        self.mon_factory_candidate = QCheckBox("Rental candidate")
+        self.mon_factory_candidate.stateChanged.connect(self.set_selected_mon_rental_candidate)
+        self.mon_factory_range = self.combo()
+        factory_form.addRow("Current", self.mon_factory_candidate)
+        factory_form.addRow("Target range", self.mon_factory_range)
+        self.mon_factory_status = QLabel()
+        self.mon_factory_status.setWordWrap(True)
+        factory_form.addRow("Status", self.mon_factory_status)
+        factory_buttons = QHBoxLayout()
+        factory_open = QPushButton("Open range")
+        factory_open.clicked.connect(self.open_selected_factory_range)
+        factory_include = QPushButton("Include")
+        factory_include.clicked.connect(lambda: self.include_selected_mon_in_factory_range())
+        factory_exclude = QPushButton("Exclude")
+        factory_exclude.clicked.connect(lambda: self.exclude_selected_mon_from_factory_ranges())
+        factory_buttons.addWidget(factory_open); factory_buttons.addWidget(factory_include); factory_buttons.addWidget(factory_exclude); factory_buttons.addStretch()
+        factory_form.addRow(factory_buttons)
+        right_layout.addWidget(factory_box)
+        buttons = QHBoxLayout(); add = QPushButton("Add"); add.clicked.connect(self.add_frontier_mon); delete = QPushButton("Delete"); delete.clicked.connect(self.delete_frontier_mon); diff = QPushButton("Diff"); diff.clicked.connect(self.show_mon_diff); save = QPushButton("Save pool"); save.clicked.connect(self.save_mons); buttons.addWidget(add); buttons.addWidget(delete); buttons.addStretch(); buttons.addWidget(diff); buttons.addWidget(save); right_layout.addLayout(buttons); split.addWidget(right); stabilize_splitter(split, 1, 1); split.setSizes([720, 760]); layout.addWidget(split); self.tabs.addTab(page, "Pokemon pool")
         self.mon_species.currentIndexChanged.connect(self.refresh_species_dependent_choices)
         self.mon_item_filter.textChanged.connect(self.refresh_item_choices); self.mon_item_category.currentIndexChanged.connect(self.refresh_item_choices)
         for control in [self.mon_species, self.mon_nickname, self.mon_item, self.mon_ability, self.mon_nature, self.mon_ball, self.mon_gender, self.mon_level, self.mon_friendship, self.mon_tera, self.mon_dmax, self.mon_dmax_level, self.mon_gmax, self.mon_shiny, self.mon_tags, *self.mon_moves, *self.ev_boxes, *self.iv_boxes]:
@@ -5210,7 +6287,13 @@ class BattleFrontierPanel(QWidget):
         self.trainer_table = QTableWidget(0, 4); self.trainer_table.setHorizontalHeaderLabels(["Trainer", "Name", "Class", "monSet"]); self.trainer_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows); self.trainer_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers); self.trainer_table.itemSelectionChanged.connect(self.select_trainer); left_layout.addWidget(self.trainer_table); split.addWidget(left)
         self.set_columns(self.trainer_table, [190, 150, 170, 210])
         right = QWidget(); right.setMinimumWidth(DETAIL_PANEL_MIN_WIDTH); right_layout = QVBoxLayout(right); trainer_box = QGroupBox("Trainer monSet"); trainer_form = QFormLayout(trainer_box); self.trainer_name = QLabel(); self.trainer_monset = self.combo(); self.trainer_monset.setEditable(True); trainer_form.addRow("Name", self.trainer_name); trainer_form.addRow("monSet inner", self.trainer_monset); trainer_buttons = QHBoxLayout(); trainer_diff = QPushButton("Trainer diff"); trainer_diff.clicked.connect(self.show_trainer_diff); trainer_save = QPushButton("Save trainer"); trainer_save.clicked.connect(self.save_trainer); trainer_buttons.addStretch(); trainer_buttons.addWidget(trainer_diff); trainer_buttons.addWidget(trainer_save); trainer_form.addRow(trainer_buttons); right_layout.addWidget(trainer_box)
-        macro_box = QGroupBox("Pool macro body"); macro_layout = QVBoxLayout(macro_box); self.macro_select = QComboBox(); stabilize_combo(self.macro_select); self.macro_select.currentIndexChanged.connect(self.select_macro); macro_layout.addWidget(self.macro_select); self.macro_editor = QPlainTextEdit(); self.macro_editor.textChanged.connect(self.macro_changed); macro_layout.addWidget(self.macro_editor); self.macro_mons = QTableWidget(0, 3); self.macro_mons.setHorizontalHeaderLabels(["Frontier ID", "Species", "Item"]); self.macro_mons.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows); self.macro_mons.itemDoubleClicked.connect(self.open_macro_mon); self.set_columns(self.macro_mons, [230, 180, 170]); macro_layout.addWidget(self.macro_mons); macro_buttons = QHBoxLayout(); macro_diff = QPushButton("Macro diff"); macro_diff.clicked.connect(self.show_macro_diff); macro_save = QPushButton("Save macro"); macro_save.clicked.connect(self.save_macro); macro_buttons.addStretch(); macro_buttons.addWidget(macro_diff); macro_buttons.addWidget(macro_save); macro_layout.addLayout(macro_buttons); right_layout.addWidget(macro_box); split.addWidget(right); stabilize_splitter(split, 1, 1); split.setSizes([720, 760]); layout.addWidget(split); self.tabs.addTab(page, "Trainer pools")
+        macro_box = QGroupBox("Pool macro body"); macro_layout = QVBoxLayout(macro_box); self.macro_select = QComboBox(); stabilize_combo(self.macro_select); self.macro_select.currentIndexChanged.connect(self.select_macro); macro_layout.addWidget(self.macro_select); self.macro_editor = QPlainTextEdit(); self.macro_editor.textChanged.connect(self.macro_changed); macro_layout.addWidget(self.macro_editor); self.macro_mons = QTableWidget(0, 3); self.macro_mons.setHorizontalHeaderLabels(["Frontier ID", "Species", "Item"]); self.macro_mons.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows); self.macro_mons.itemDoubleClicked.connect(self.open_macro_mon); self.set_columns(self.macro_mons, [230, 180, 170]); macro_layout.addWidget(self.macro_mons)
+        macro_candidate = QHBoxLayout(); self.macro_mon_combo = self.combo(); self.macro_mon_combo.setEditable(True); macro_candidate.addWidget(self.macro_mon_combo)
+        macro_add = QPushButton("Add candidate"); macro_add.clicked.connect(self.add_macro_candidate)
+        macro_replace = QPushButton("Replace selected"); macro_replace.clicked.connect(self.replace_macro_candidate)
+        macro_remove = QPushButton("Remove selected"); macro_remove.clicked.connect(self.remove_macro_candidate)
+        macro_candidate.addWidget(macro_add); macro_candidate.addWidget(macro_replace); macro_candidate.addWidget(macro_remove); macro_layout.addLayout(macro_candidate)
+        macro_buttons = QHBoxLayout(); macro_diff = QPushButton("Macro diff"); macro_diff.clicked.connect(self.show_macro_diff); macro_save = QPushButton("Save macro"); macro_save.clicked.connect(self.save_macro); macro_buttons.addStretch(); macro_buttons.addWidget(macro_diff); macro_buttons.addWidget(macro_save); macro_layout.addLayout(macro_buttons); right_layout.addWidget(macro_box); split.addWidget(right); stabilize_splitter(split, 1, 1); split.setSizes([720, 760]); layout.addWidget(split); self.tabs.addTab(page, "Trainer pools")
 
     def build_general_trainers_tab(self) -> None:
         page = QWidget(); layout = QVBoxLayout(page); split = QSplitter(Qt.Orientation.Horizontal)
@@ -5269,7 +6352,7 @@ class BattleFrontierPanel(QWidget):
     @staticmethod
     def set_combo(combo: QComboBox, data: str) -> None:
         index = combo.findData(data); combo.setCurrentIndex(index if index >= 0 else 0)
-        if index < 0 and combo.isEditable(): combo.setEditText(data)
+        if index < 0 and combo.isEditable(): combo.setEditText(str(data))
 
     def load(self) -> None:
         if not self.window.root_valid(): return
@@ -5279,14 +6362,32 @@ class BattleFrontierPanel(QWidget):
     def load_reference_data(self) -> None:
         root = self.window.root
         species_paths = list((root / "src/data/pokemon/species_info").glob("*_families.h")) + [root / "src/data/pokemon/species_info.h"]
-        species_records, _ = indexed_records(root, [path for path in species_paths if path.exists()], "SPECIES_", ["speciesName", "abilities", "levelUpLearnset", "eggMoveLearnset", "teachableLearnset"])
+        type_macros = self.load_type_macros([path for path in species_paths if path.exists()])
+        species_records, _ = indexed_records(root, [path for path in species_paths if path.exists()], "SPECIES_", ["speciesName", "abilities", "types", "natDexNum", "levelUpLearnset", "eggMoveLearnset", "teachableLearnset"])
         move_records, _ = indexed_records(root, [root / "src/data/moves_info.h"], "MOVE_", ["name", "type", "category"])
         item_records, _ = indexed_records(root, [root / "src/data/items.h"], "ITEM_", ["name", "pocket", "holdEffect"])
         ability_records, _ = indexed_records(root, [root / "src/data/abilities.h"], "ABILITY_", ["name"])
         self.species_values = enum_values(root / "include/constants/species.h", "SPECIES_"); self.move_values = enum_values(root / "include/constants/moves.h", "MOVE_"); self.item_values = enum_values(root / "include/constants/items.h", "ITEM_")
+        dex_values = enum_values(root / "include/constants/pokedex.h", "NATIONAL_DEX_")
         self.species_names = {record.key: string_from_record(record, "speciesName") for record in species_records}; self.move_names = {record.key: string_from_record(record, "name") for record in move_records}; self.item_names = {record.key: string_from_record(record, "name") or record.key for record in item_records}; self.ability_names = {record.key: string_from_record(record, "name") for record in ability_records}
         self.move_metadata = {record.key: MoveMetadata(first_token(record.values.get("type", ""), "TYPE_", "TYPE_NONE"), first_token(record.values.get("category", ""), "DAMAGE_CATEGORY_", "")) for record in move_records}
         self.species_abilities = {record.key: unique_tokens(re.findall(r"\bABILITY_[A-Z0-9_]+\b", record.values.get("abilities", "")), keep_none=False) or ["ABILITY_NONE"] for record in species_records}
+        self.species_dex_numbers = {}
+        self.species_types = {}
+        for record in species_records:
+            dex_number = token_value(record.values.get("natDexNum", ""), dex_values)
+            self.species_dex_numbers[record.key] = dex_number if dex_number is not None else self.species_values.get(record.key, 999999)
+            type_args = self.resolve_species_type_args(record.values.get("types", ""), type_macros)
+            if len(type_args) == 1:
+                type_args.append(type_args[0])
+            self.species_types[record.key] = (type_args[0], type_args[1])
+        for species, (dex_number, type_args) in self.load_macro_initialized_species([path for path in species_paths if path.exists()], dex_values).items():
+            if dex_number is not None:
+                self.species_dex_numbers.setdefault(species, dex_number)
+            if type_args:
+                if len(type_args) == 1:
+                    type_args.append(type_args[0])
+                self.species_types.setdefault(species, (type_args[0], type_args[1]))
         self.item_pockets = {record.key: record.values.get("pocket", "") for record in item_records}; self.item_hold_effects = {record.key: record.values.get("holdEffect", "HOLD_EFFECT_NONE") for record in item_records}
         self.frontier_values = define_values(root / "include/constants/battle_frontier_mons.h", ("FRONTIER_MON_", "FRONTIER_MONS_", "NUM_FRONTIER_MONS"))
         self.frontier_by_value = {value: key for key, value in self.frontier_values.items() if key.startswith("FRONTIER_MON_")}
@@ -5420,6 +6521,82 @@ class BattleFrontierPanel(QWidget):
             combo.addItem(f"{labels.get(key, key)} [{key}]", key)
         if combo.findData(fallback) >= 0: combo.setCurrentIndex(combo.findData(fallback))
         combo.blockSignals(False)
+
+    @staticmethod
+    def load_type_macros(paths: Iterable[Path]) -> dict[str, list[str]]:
+        macros: dict[str, list[str]] = {}
+        for path in paths:
+            source = read_utf8(path)
+            for match in re.finditer(r"(?m)^\s*#define\s+([A-Z0-9_]*TYPE[A-Z0-9_]*)\s+(.+)$", source):
+                name, value = match.groups()
+                if name in macros:
+                    continue
+                tokens = [token for token in re.findall(r"\bTYPE_[A-Z0-9_]+\b", value) if token in TYPE_LABELS]
+                if not tokens:
+                    continue
+                if "?" in value and ":" in value:
+                    tokens = tokens[:1]
+                macros[name] = tokens[:2]
+        return macros
+
+    @staticmethod
+    def resolve_species_type_args(raw_value: str, type_macros: dict[str, list[str]]) -> list[str]:
+        args = macro_arguments(raw_value)
+        if not args:
+            args = [raw_value.strip()]
+        result: list[str] = []
+        for arg in args:
+            stripped = arg.strip()
+            if stripped in TYPE_LABELS:
+                result.append(stripped)
+                continue
+            if stripped in type_macros:
+                result.extend(type_macros[stripped])
+                continue
+            nested = re.search(r"\b([A-Z0-9_]*TYPE[A-Z0-9_]*)\b", stripped)
+            if nested and nested.group(1) in type_macros:
+                result.extend(type_macros[nested.group(1)])
+                continue
+            direct = next((token for token in re.findall(r"\bTYPE_[A-Z0-9_]+\b", stripped) if token in TYPE_LABELS), None)
+            if direct:
+                result.append(direct)
+        return (result or ["TYPE_NONE"])[:2]
+
+    @staticmethod
+    def logical_c_lines(source: str) -> Iterable[str]:
+        lines = source.splitlines()
+        index = 0
+        while index < len(lines):
+            line = lines[index]
+            while line.rstrip().endswith("\\") and index + 1 < len(lines):
+                index += 1
+                line += "\n" + lines[index]
+            yield line
+            index += 1
+
+    @staticmethod
+    def load_macro_initialized_species(paths: Iterable[Path], dex_values: dict[str, int]) -> dict[str, tuple[int | None, list[str]]]:
+        result: dict[str, tuple[int | None, list[str]]] = {}
+        for path in paths:
+            source = read_utf8(path)
+            macro_info: dict[str, tuple[int | None, list[str]]] = {}
+            for logical_line in BattleFrontierPanel.logical_c_lines(source):
+                define = re.match(r"\s*#define\s+([A-Z0-9_]+)\s*(?:\([^)]*\))?\s+(.+)", logical_line, re.S)
+                if not define:
+                    continue
+                name, body = define.groups()
+                dex_token = first_token(body, "NATIONAL_DEX_", "")
+                dex_number = token_value(dex_token, dex_values) if dex_token else None
+                type_tokens = [token for token in re.findall(r"\bTYPE_[A-Z0-9_]+\b", body) if token in TYPE_LABELS]
+                if "?" in body and ":" in body:
+                    type_tokens = type_tokens[:1]
+                if dex_number is not None or type_tokens:
+                    macro_info[name] = (dex_number, type_tokens[:2])
+            for assignment in re.finditer(r"\[(SPECIES_[A-Z0-9_]+)\]\s*=\s*([A-Z0-9_]+)\s*\(", source):
+                species, macro_name = assignment.groups()
+                if macro_name in macro_info:
+                    result[species] = macro_info[macro_name]
+        return result
 
     def build_species_learnsets(self, species_records: list[SourceRecord]) -> dict[str, set[str]]:
         root = self.window.root / "src/data/pokemon"
@@ -5560,6 +6737,7 @@ class BattleFrontierPanel(QWidget):
     def load_factory(self) -> None:
         self.factory_path = self.window.root / "src/battle_factory.c"; self.factory_source = read_utf8(self.factory_path) if self.factory_path.exists() else ""; self.factory_ranges.clear(); self.factory_ivs.clear(); self.range_states.clear(); self.iv_states.clear()
         self.parse_factory_ranges(); self.parse_factory_ivs(); self.rebuild_factory_usage()
+        self.refresh_factory_range_choices()
 
     def parse_factory_ranges(self) -> None:
         match = re.search(r"static\s+const\s+u16\s+sInitialRentalMonRanges\[\]\[2\]\s*=\s*\{", self.factory_source)
@@ -5591,11 +6769,47 @@ class BattleFrontierPanel(QWidget):
     def rebuild_factory_usage(self) -> None:
         self.factory_usage = set()
         for row in self.factory_ranges:
-            first = token_value(row.first, self.frontier_values); last = token_value(row.last, self.frontier_values)
+            first_token_value, last_token_value = self.factory_range_tokens(row)
+            first = token_value(first_token_value, self.frontier_values); last = token_value(last_token_value, self.frontier_values)
             if first is None or last is None: continue
             for value in range(first, last + 1):
                 key = self.frontier_by_value.get(value)
                 if key: self.factory_usage.add(key)
+
+    def factory_range_tokens(self, record: FactoryRangeRecord) -> tuple[str, str]:
+        return self.range_states.get(record.index, (record.first, record.last))
+
+    def factory_range_values(self, record: FactoryRangeRecord) -> tuple[int | None, int | None]:
+        first, last = self.factory_range_tokens(record)
+        return token_value(first, self.frontier_values), token_value(last, self.frontier_values)
+
+    def factory_ranges_for_key(self, key: str) -> list[FactoryRangeRecord]:
+        value = self.frontier_values.get(key)
+        if value is None:
+            return []
+        ranges: list[FactoryRangeRecord] = []
+        for record in self.factory_ranges:
+            first, last = self.factory_range_values(record)
+            if first is not None and last is not None and first <= value <= last:
+                ranges.append(record)
+        return ranges
+
+    def factory_range_label(self, record: FactoryRangeRecord) -> str:
+        first, last = self.factory_range_tokens(record)
+        count = self.range_count(first, last)
+        challenge = (record.index % max(1, len(self.factory_ranges) // 2)) + 1
+        return f"{record.mode} #{challenge}: {first} - {last} ({count if count is not None else '?'} mons)"
+
+    def refresh_factory_range_choices(self) -> None:
+        if not hasattr(self, "mon_factory_range"):
+            return
+        current = self.mon_factory_range.currentData()
+        self.mon_factory_range.blockSignals(True); self.mon_factory_range.clear()
+        for record in self.factory_ranges:
+            self.mon_factory_range.addItem(self.factory_range_label(record), record.index)
+        if isinstance(current, int) and self.mon_factory_range.findData(current) >= 0:
+            self.mon_factory_range.setCurrentIndex(self.mon_factory_range.findData(current))
+        self.mon_factory_range.blockSignals(False)
 
     def mon_flag_values(self, record: SourceRecord) -> dict[str, bool]:
         item = first_token(record.values.get("heldItem", ""), "ITEM_", "ITEM_NONE")
@@ -5610,24 +6824,197 @@ class BattleFrontierPanel(QWidget):
             "unused": self.mon_usage_counts.get(record.key, 0) == 0,
         }
 
+    def record_species(self, record: SourceRecord) -> str:
+        return first_token(record.values.get("species", ""), "SPECIES_", "SPECIES_NONE")
+
+    def record_frontier_id(self, record: SourceRecord) -> int:
+        return self.frontier_values.get(record.key, 999999)
+
+    def record_dex_number(self, record: SourceRecord) -> int:
+        species = self.record_species(record)
+        number = self.species_dex_numbers.get(species)
+        if number is None or number <= 0:
+            return 999999
+        return number
+
+    @staticmethod
+    def generation_for_dex(dex_number: int) -> int:
+        if dex_number <= 0 or dex_number >= 999999:
+            return 99
+        if dex_number <= 151:
+            return 1
+        if dex_number <= 251:
+            return 2
+        if dex_number <= 386:
+            return 3
+        if dex_number <= 493:
+            return 4
+        if dex_number <= 649:
+            return 5
+        if dex_number <= 721:
+            return 6
+        if dex_number <= 809:
+            return 7
+        if dex_number <= 905:
+            return 8
+        return 9
+
+    def record_type_pair(self, record: SourceRecord) -> tuple[str, str]:
+        return self.species_types.get(self.record_species(record), ("TYPE_NONE", "TYPE_NONE"))
+
+    def record_type_label(self, record: SourceRecord) -> str:
+        type1, type2 = self.record_type_pair(record)
+        if type1 == "TYPE_NONE":
+            return "-"
+        if type1 == type2 or type2 == "TYPE_NONE":
+            return TYPE_LABELS.get(type1, type1)
+        return f"{TYPE_LABELS.get(type1, type1)}/{TYPE_LABELS.get(type2, type2)}"
+
+    @staticmethod
+    def type_sort_value(type_token: str) -> int:
+        if type_token == "TYPE_NONE":
+            return 999
+        try:
+            return list(TYPE_LABELS).index(type_token)
+        except ValueError:
+            return 999
+
+    def mon_sort_key(self, record: SourceRecord) -> tuple:
+        mode = self.mon_sort.currentData() if hasattr(self, "mon_sort") else "dex"
+        species = self.record_species(record)
+        name = self.species_names.get(species, species)
+        dex_number = self.record_dex_number(record)
+        frontier_id = self.record_frontier_id(record)
+        generation = self.generation_for_dex(dex_number)
+        type1, type2 = self.record_type_pair(record)
+        if mode == "generation":
+            return (generation, dex_number, name.casefold(), frontier_id)
+        if mode == "type":
+            return (self.type_sort_value(type1), self.type_sort_value(type2), dex_number, name.casefold(), frontier_id)
+        if mode == "frontier":
+            return (frontier_id, dex_number, name.casefold())
+        if mode == "species":
+            return (name.casefold(), dex_number, frontier_id)
+        return (dex_number, name.casefold(), frontier_id)
+
     def visible_mons(self) -> list[SourceRecord]:
         query = self.mon_search.text().casefold(); rows = []
         for record in self.records:
-            species = first_token(record.values.get("species", ""), "SPECIES_", "SPECIES_NONE")
-            haystack = " ".join([record.key, species, self.species_names.get(species, ""), record.values.get("heldItem", "")]).casefold()
+            species = self.record_species(record)
+            dex_number = self.record_dex_number(record)
+            generation = self.generation_for_dex(dex_number)
+            haystack = " ".join([record.key, species, self.species_names.get(species, ""), record.values.get("heldItem", ""), self.record_type_label(record), f"no.{dex_number:03}", f"gen{generation}"]).casefold()
             if query and query not in haystack: continue
             if self.mon_unused_only.isChecked() and self.mon_usage_counts.get(record.key, 0): continue
             rows.append(record)
-        return rows
+        return sorted(rows, key=self.mon_sort_key)
 
     def refresh_mons(self) -> None:
         rows = self.visible_mons(); self.mon_table.setRowCount(len(rows))
         for row, record in enumerate(rows):
-            species = first_token(record.values.get("species", ""), "SPECIES_", "SPECIES_NONE"); item = first_token(record.values.get("heldItem", ""), "ITEM_", "ITEM_NONE")
+            species = self.record_species(record); item = first_token(record.values.get("heldItem", ""), "ITEM_", "ITEM_NONE")
+            dex_number = self.record_dex_number(record); generation = self.generation_for_dex(dex_number)
             flags = self.mon_flag_values(record)
-            values = [str(self.frontier_values.get(record.key, "")), record.key, self.species_names.get(species, species), self.item_names.get(item, item), str(self.mon_usage_counts.get(record.key, 0)), "yes" if record.key in self.factory_usage else "", *["✓" if flags[key] else "" for key in ("mega", "z", "dmax", "tera", "shiny", "unused")]]
+            values = [f"No.{dex_number:03}" if dex_number < 999999 else "-", f"Gen {generation}" if generation != 99 else "-", record.key, self.species_names.get(species, species), self.record_type_label(record), self.item_names.get(item, item), str(self.mon_usage_counts.get(record.key, 0)), "yes" if record.key in self.factory_usage else "", *["✓" if flags[key] else "" for key in ("mega", "z", "dmax", "tera", "shiny", "unused")]]
             for column, value in enumerate(values):
                 item_widget = QTableWidgetItem(value); item_widget.setData(Qt.ItemDataRole.UserRole, record); self.mon_table.setItem(row, column, item_widget)
+
+    def update_mon_factory_controls(self) -> None:
+        if not hasattr(self, "mon_factory_candidate"):
+            return
+        self.refresh_factory_range_choices()
+        key = self.current_mon.key if self.current_mon else ""
+        ranges = self.factory_ranges_for_key(key) if key else []
+        self.mon_factory_candidate.blockSignals(True)
+        self.mon_factory_candidate.setChecked(bool(ranges))
+        self.mon_factory_candidate.blockSignals(False)
+        if ranges:
+            self.set_combo(self.mon_factory_range, ranges[0].index)
+            self.mon_factory_status.setText("; ".join(self.factory_range_label(record) for record in ranges))
+        elif key:
+            self.mon_factory_status.setText("Not included in any Battle Factory rental range.")
+        else:
+            self.mon_factory_status.setText("")
+
+    def set_selected_mon_rental_candidate(self) -> None:
+        if self.loading or not self.current_mon:
+            return
+        if self.mon_factory_candidate.isChecked():
+            self.include_selected_mon_in_factory_range()
+        else:
+            self.exclude_selected_mon_from_factory_ranges()
+
+    def include_selected_mon_in_factory_range(self) -> None:
+        if not self.current_mon:
+            return
+        key = self.current_mon.key
+        target_value = self.frontier_values.get(key)
+        if target_value is None:
+            QMessageBox.warning(self, "Factory range", f"{key} has no numeric Frontier ID."); return
+        if not self.factory_ranges:
+            QMessageBox.warning(self, "Factory range", "sInitialRentalMonRanges was not found."); return
+        index = self.mon_factory_range.currentData()
+        if not isinstance(index, int) or index >= len(self.factory_ranges):
+            index = 0
+        record = self.factory_ranges[index]
+        first_token_text, last_token_text = self.factory_range_tokens(record)
+        first_value, last_value = self.factory_range_values(record)
+        if first_value is None or last_value is None:
+            QMessageBox.warning(self, "Factory range", f"Invalid range: {first_token_text} - {last_token_text}"); return
+        new_first = key if target_value < first_value else first_token_text
+        new_last = key if target_value > last_value else last_token_text
+        self.range_states[record.index] = (new_first, new_last)
+        self.after_factory_range_edit(f"Included {key} in {self.factory_range_label(record)}")
+
+    def exclude_selected_mon_from_factory_ranges(self) -> None:
+        if not self.current_mon:
+            return
+        key = self.current_mon.key
+        target_value = self.frontier_values.get(key)
+        if target_value is None:
+            QMessageBox.warning(self, "Factory range", f"{key} has no numeric Frontier ID."); return
+        ranges = self.factory_ranges_for_key(key)
+        if not ranges:
+            self.update_mon_factory_controls(); return
+        proposed: dict[int, tuple[str, str]] = {}
+        for record in ranges:
+            first_token_text, last_token_text = self.factory_range_tokens(record)
+            first_value, last_value = self.factory_range_values(record)
+            if first_value is None or last_value is None:
+                QMessageBox.warning(self, "Factory range", f"Invalid range: {first_token_text} - {last_token_text}"); return
+            if first_value == last_value:
+                QMessageBox.warning(self, "Factory range", "Cannot exclude the only mon in a range without changing battle_factory.c logic."); return
+            if target_value == first_value:
+                replacement = self.frontier_by_value.get(target_value + 1)
+                if not replacement:
+                    QMessageBox.warning(self, "Factory range", "No next Frontier ID was found for range start."); return
+                proposed[record.index] = (replacement, last_token_text)
+            elif target_value == last_value:
+                replacement = self.frontier_by_value.get(target_value - 1)
+                if not replacement:
+                    QMessageBox.warning(self, "Factory range", "No previous Frontier ID was found for range end."); return
+                proposed[record.index] = (first_token_text, replacement)
+            else:
+                QMessageBox.warning(self, "Factory range", f"{key} is inside the middle of {self.factory_range_label(record)}. Excluding it safely needs code-level skip-list logic or Frontier ID reordering.")
+                return
+        self.range_states.update(proposed)
+        self.after_factory_range_edit(f"Excluded {key} from Battle Factory rental ranges")
+
+    def after_factory_range_edit(self, message: str) -> None:
+        self.rebuild_factory_usage(); self.refresh_mons(); self.refresh_factory(); self.update_mon_factory_controls(); self.window.status(message)
+
+    def open_selected_factory_range(self) -> None:
+        data = self.mon_factory_range.currentData() if hasattr(self, "mon_factory_range") else None
+        if not isinstance(data, int):
+            return
+        self.tabs.setCurrentIndex(3)
+        self.select_factory_range_index(data)
+
+    def select_factory_range_index(self, index: int) -> None:
+        for row in range(self.range_table.rowCount()):
+            item = self.range_table.item(row, 0)
+            if item and item.data(Qt.ItemDataRole.UserRole) == index:
+                self.range_table.selectRow(row); return
 
     def has_pending_frontier_mon_changes(self) -> bool:
         self.capture_mon()
@@ -5787,7 +7174,7 @@ class BattleFrontierPanel(QWidget):
         for spin, value in zip(self.iv_boxes, numeric_args(values["iv"], 6)): spin.setValue(value)
         self.mon_level.setValue(display_integer(values["lvl"])); self.mon_friendship.setValue(display_integer(values["friendship"])); self.mon_dmax_level.setValue(display_integer(values["dynamaxLevel"]))
         self.mon_shiny.setChecked(bool_literal(values["isShiny"])); self.mon_gmax.setChecked(bool_literal(values["gigantamaxFactor"])); self.mon_dmax.setChecked(bool_literal(values["shouldUseDynamax"])); self.mon_tags.setText(values["tags"])
-        self.loading = False; self.update_mon_summary()
+        self.loading = False; self.update_mon_summary(); self.update_mon_factory_controls()
 
     def refresh_move_choices(self) -> None:
         if not hasattr(self, "mon_moves"): return
@@ -5891,8 +7278,9 @@ class BattleFrontierPanel(QWidget):
 
     def select_mon_key(self, key: str) -> None:
         for row in range(self.mon_table.rowCount()):
-            item = self.mon_table.item(row, 1)
-            if item and item.text() == key: self.mon_table.selectRow(row); return
+            item = self.mon_table.item(row, 0)
+            record = item.data(Qt.ItemDataRole.UserRole) if item else None
+            if isinstance(record, SourceRecord) and record.key == key: self.mon_table.selectRow(row); return
 
     def show_mon_diff(self) -> None:
         self.capture_mon()
@@ -6133,11 +7521,97 @@ class BattleFrontierPanel(QWidget):
         self.loading = True; self.macro_editor.setPlainText(self.current_macro.raw if self.current_macro else ""); self.macro_original = self.macro_editor.toPlainText(); self.loading = False; self.refresh_macro_mons()
 
     def refresh_macro_mons(self) -> None:
+        self.refresh_macro_candidate_choices()
         raw = self.macro_editor.toPlainText(); mons = re.findall(r"\bFRONTIER_MON_[A-Z0-9_]+\b", raw); self.macro_mons.setRowCount(len(mons)); by_key = {record.key: record for record in self.records}
         for row, key in enumerate(mons):
             record = by_key.get(key); species = first_token(record.values.get("species", ""), "SPECIES_", "SPECIES_NONE") if record else ""; held = first_token(record.values.get("heldItem", ""), "ITEM_", "ITEM_NONE") if record else ""
             for column, value in enumerate((key, self.species_names.get(species, species), self.item_names.get(held, held))):
                 item = QTableWidgetItem(value); item.setData(Qt.ItemDataRole.UserRole, key); self.macro_mons.setItem(row, column, item)
+
+    def refresh_macro_candidate_choices(self) -> None:
+        if not hasattr(self, "macro_mon_combo"):
+            return
+        current = self.combo_value(self.macro_mon_combo)
+        self.macro_mon_combo.blockSignals(True); self.macro_mon_combo.clear(); self.macro_mon_combo.setEditable(True)
+        for record in sorted(self.records, key=lambda item: self.frontier_values.get(item.key, 999999)):
+            species = first_token(record.values.get("species", ""), "SPECIES_", "SPECIES_NONE")
+            held = first_token(record.values.get("heldItem", ""), "ITEM_", "ITEM_NONE")
+            label = f"{record.key} / {self.species_names.get(species, species)} / {self.item_names.get(held, held)}"
+            self.macro_mon_combo.addItem(label, record.key)
+        if current:
+            self.set_combo(self.macro_mon_combo, current)
+        self.macro_mon_combo.blockSignals(False)
+
+    @staticmethod
+    def macro_candidate_line(key: str) -> str:
+        return f"    {key:<24} " + "\\\n"
+
+    def selected_macro_candidate_row(self) -> int | None:
+        selected = self.macro_mons.selectedItems()
+        return selected[0].row() if selected else None
+
+    def macro_candidate_key(self) -> str:
+        key = self.combo_value(self.macro_mon_combo) if hasattr(self, "macro_mon_combo") else ""
+        found = re.search(r"\b(FRONTIER_MON_[A-Z0-9_]+)\b", key)
+        return found.group(1) if found else key.strip()
+
+    def macro_token_matches(self) -> list[re.Match[str]]:
+        return list(re.finditer(r"\bFRONTIER_MON_[A-Z0-9_]+\b", self.macro_editor.toPlainText()))
+
+    def set_macro_editor_text(self, text: str) -> None:
+        self.macro_editor.setPlainText(text)
+        self.refresh_macro_mons()
+
+    def add_macro_candidate(self) -> None:
+        key = self.macro_candidate_key()
+        if not key:
+            return
+        raw = self.macro_editor.toPlainText()
+        match = re.search(r"(?m)^[ \t]*-1\b", raw)
+        line = self.macro_candidate_line(key)
+        if match:
+            raw = raw[:match.start()] + line + raw[match.start():]
+        else:
+            raw = raw.rstrip("\r\n") + "\n" + line
+        self.set_macro_editor_text(raw)
+        self.window.status(f"Added trainer pool candidate: {key}")
+
+    def replace_macro_candidate(self) -> None:
+        key = self.macro_candidate_key()
+        row = self.selected_macro_candidate_row()
+        if not key or row is None:
+            self.add_macro_candidate(); return
+        raw = self.macro_editor.toPlainText(); matches = self.macro_token_matches()
+        if row >= len(matches):
+            return
+        match = matches[row]
+        raw = raw[:match.start()] + key + raw[match.end():]
+        self.set_macro_editor_text(raw)
+        self.window.status(f"Replaced trainer pool candidate with {key}")
+
+    def remove_macro_candidate(self) -> None:
+        row = self.selected_macro_candidate_row()
+        if row is None:
+            return
+        raw = self.macro_editor.toPlainText(); matches = self.macro_token_matches()
+        if row >= len(matches):
+            return
+        match = matches[row]
+        line_start = raw.rfind("\n", 0, match.start()) + 1
+        line_end = raw.find("\n", match.end())
+        if line_end < 0:
+            line_end = len(raw)
+            keep_newline = ""
+        else:
+            keep_newline = "\n"; line_end += 1
+        line = raw[line_start:line_end]
+        if len(re.findall(r"\bFRONTIER_MON_[A-Z0-9_]+\b", line)) == 1:
+            raw = raw[:line_start] + raw[line_end:]
+        else:
+            line = re.sub(r"\s*,?\s*" + re.escape(match.group(0)), "", line, count=1)
+            raw = raw[:line_start] + line.rstrip("\r\n") + keep_newline + raw[line_end:]
+        self.set_macro_editor_text(raw)
+        self.window.status(f"Removed trainer pool candidate: {match.group(0)}")
 
     def macro_changed(self) -> None:
         if self.loading: return
@@ -6164,6 +7638,7 @@ class BattleFrontierPanel(QWidget):
         if key: self.tabs.setCurrentIndex(0); self.select_mon_key(key)
 
     def refresh_factory(self) -> None:
+        self.refresh_factory_range_choices()
         self.range_table.setRowCount(len(self.factory_ranges))
         for row, record in enumerate(self.factory_ranges):
             first, last = self.range_states.get(record.index, (record.first, record.last)); count = self.range_count(first, last)
@@ -6201,7 +7676,10 @@ class BattleFrontierPanel(QWidget):
         selected_iv = self.iv_table.selectedItems()
         if selected_iv:
             index = selected_iv[0].data(Qt.ItemDataRole.UserRole); self.iv_states[index] = (self.iv_low.value(), self.iv_high.value())
+        self.rebuild_factory_usage()
         self.refresh_factory()
+        self.refresh_mons()
+        self.update_mon_factory_controls()
 
     def update_range_status(self) -> None:
         first = self.combo_value(self.range_start); last = self.combo_value(self.range_end); count = self.range_count(first, last)
@@ -6230,7 +7708,7 @@ class BattleFrontierPanel(QWidget):
             write_with_backup(self.factory_path, new_source)
         except (OSError, RuntimeError) as error:
             QMessageBox.critical(self, "Save failed", str(error)); return
-        self.load_factory(); self.refresh_factory(); self.window.status("Saved Battle Factory ranges / IV table")
+        self.load_factory(); self.refresh_factory(); self.refresh_mons(); self.update_mon_factory_controls(); self.window.status("Saved Battle Factory ranges / IV table")
 
     def show_factory_diff(self) -> None:
         try: after = self.pending_factory_source()
@@ -6257,8 +7735,8 @@ class Workbench(QMainWindow):
         super().__init__(); self.settings = QSettings("PokemonDecompTools", "ExpansionStudio"); self.lang = self.settings.value("ui/language", "ja"); self.root = Path(self.settings.value("repo/root", str(Path.cwd()))); self.tool_dir = writable_tool_dir(); self.process: QProcess | None = None; self.command_log: QDialog | None = None
         self.loaded_panels: set[str] = set(); self.loading_depth = 0; self.auto_terminal_key = ""
         self.setStatusBar(QStatusBar()); self.make_toolbar(); self.loading_label = QLabel("読み込み中..."); self.loading_label.setVisible(False); self.statusBar().addPermanentWidget(self.loading_label); self.tabs = QTabWidget(); self.setCentralWidget(self.tabs)
-        self.translation = TranslationPanel(self); self.constants = ConstantsPanel(self); self.files = FileSearchPanel(self); self.index = CodeIndexPanel(self); self.rom_layout = RomLayoutPanel(self); self.species = PokemonStudioPanel(self); self.moves = MoveStudioPanel(self); self.maps = MapEncounterPanel(self); self.frontier = BattleFrontierPanel(self); self.assets = AssetPanel(self); self.dependencies = DependencyPanel(self); self.fonts = FontPanel(self); self.poryscript = PoryscriptPanel(self); self.tool_settings = SettingsPanel(self)
-        self.panels: list[tuple[str, QWidget, Callable[[], None] | None]] = [("translation", self.translation, self.translation.load), ("constants", self.constants, self.constants.load), ("files", self.files, None), ("index", self.index, self.index.load), ("rom_layout", self.rom_layout, self.rom_layout.load), ("species", self.species, self.species.load), ("moves", self.moves, self.moves.load), ("maps", self.maps, self.maps.load), ("frontier", self.frontier, self.frontier.load), ("assets", self.assets, self.assets.load), ("dependencies", self.dependencies, None), ("fonts", self.fonts, self.fonts.load), ("poryscript", self.poryscript, self.poryscript.load), ("settings", self.tool_settings, self.tool_settings.load)]
+        self.translation = TranslationPanel(self); self.constants = ConstantsPanel(self); self.files = FileSearchPanel(self); self.index = CodeIndexPanel(self); self.rom_layout = RomLayoutPanel(self); self.rom_binary = RomBinaryViewerPanel(self); self.patches = PatchCreatorPanel(self); self.species = PokemonStudioPanel(self); self.moves = MoveStudioPanel(self); self.maps = MapEncounterPanel(self); self.frontier = BattleFrontierPanel(self); self.assets = AssetPanel(self); self.dependencies = DependencyPanel(self); self.fonts = FontPanel(self); self.poryscript = PoryscriptPanel(self); self.tool_settings = SettingsPanel(self)
+        self.panels: list[tuple[str, QWidget, Callable[[], None] | None]] = [("translation", self.translation, self.translation.load), ("constants", self.constants, self.constants.load), ("files", self.files, None), ("index", self.index, self.index.load), ("rom_layout", self.rom_layout, self.rom_layout.load), ("rom_binary", self.rom_binary, self.rom_binary.load), ("patches", self.patches, None), ("species", self.species, self.species.load), ("moves", self.moves, self.moves.load), ("maps", self.maps, self.maps.load), ("frontier", self.frontier, self.frontier.load), ("assets", self.assets, self.assets.load), ("dependencies", self.dependencies, None), ("fonts", self.fonts, self.fonts.load), ("poryscript", self.poryscript, self.poryscript.load), ("settings", self.tool_settings, self.tool_settings.load)]
         for key, panel, _loader in self.panels: self.tabs.addTab(panel, tr(key, self.lang))
         self.tabs.currentChanged.connect(lambda _index: self.load_current())
         self.retranslate(); self.apply_readability_style(); self.resize(1580, 960)
@@ -6275,6 +7753,8 @@ class Workbench(QMainWindow):
             QHeaderView::section { padding: 4px 6px; }
         """)
         for table in self.findChildren(QTableWidget):
+            if table.objectName() in {"romBinaryTable", "romLayoutBinaryPreview"}:
+                continue
             configure_table(table)
         for combo in self.findChildren(QComboBox):
             stabilize_combo(combo)

@@ -6,17 +6,23 @@ from __future__ import annotations
 import sys
 import pathlib
 import site
+import shutil
 from datetime import datetime
 from pathlib import Path
 
 
 TOOL_DIR = Path(__file__).resolve().parent
-ENTRY_POINT = TOOL_DIR / "ポケモンデコンプ作業ツール.py"
+ENTRY_POINT_CANDIDATES = [
+    TOOL_DIR / "ExpansionStudio.py",
+    TOOL_DIR / "ポケモンデコンプ作業ツール.py",
+]
 ICON_PNG = TOOL_DIR / "em.png"
 ICON_ICO = TOOL_DIR / "em.ico"
 TEMPLATE_DIR = TOOL_DIR / "templates"
 DIST_DIR = TOOL_DIR / "dist"
 BUILD_ROOT = TOOL_DIR / "build" / "pyinstaller"
+EXE_NAME = "ExpansionStudio.exe"
+LEGACY_EXE_NAME = "ポケモンデコンプ作業ツール.exe"
 
 
 def make_ico() -> Path | None:
@@ -65,8 +71,10 @@ def patch_pyinstaller_site_scan() -> None:
 
 
 def main() -> int:
-    if not ENTRY_POINT.exists():
-        print(f"Entry point not found: {ENTRY_POINT}")
+    entry_point = next((path for path in ENTRY_POINT_CANDIDATES if path.exists()), None)
+    if entry_point is None:
+        candidates = "\n  ".join(str(path) for path in ENTRY_POINT_CANDIDATES)
+        print(f"Entry point not found. Expected one of:\n  {candidates}")
         return 1
     try:
         from PyInstaller.__main__ import run
@@ -94,15 +102,21 @@ def main() -> int:
         "--distpath", str(dist),
         "--workpath", str(work),
         "--specpath", str(spec),
-        "--add-data", f"{ICON_PNG}{';' if sys.platform == 'win32' else ':'}.",
     ]
+    if ICON_PNG.exists():
+        args.extend(["--add-data", f"{ICON_PNG}{';' if sys.platform == 'win32' else ':'}."])
     if TEMPLATE_DIR.exists():
         args.extend(["--add-data", f"{TEMPLATE_DIR}{';' if sys.platform == 'win32' else ':'}templates"])
     if icon:
         args.extend(["--icon", str(icon)])
-    args.append(str(ENTRY_POINT))
+    args.append(str(entry_point))
     run(args)
-    print(f"Created: {dist / 'ExpansionStudio.exe'}")
+    built_exe = dist / EXE_NAME
+    legacy_exe = dist / LEGACY_EXE_NAME
+    if built_exe.exists():
+        shutil.copy2(built_exe, legacy_exe)
+    print(f"Created: {built_exe}")
+    print(f"Synced legacy launcher: {legacy_exe}")
     return 0
 
 

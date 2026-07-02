@@ -102,6 +102,8 @@ def main() -> int:
         "--distpath", str(dist),
         "--workpath", str(work),
         "--specpath", str(spec),
+        "--paths", str(TOOL_DIR),
+        "--paths", str(TOOL_DIR.parent),
     ]
     if ICON_PNG.exists():
         args.extend(["--add-data", f"{ICON_PNG}{';' if sys.platform == 'win32' else ':'}."])

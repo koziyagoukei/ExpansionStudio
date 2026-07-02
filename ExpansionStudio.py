@@ -24,6 +24,17 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable, Iterable
 
+for project_module_root in (Path(__file__).resolve().parent, Path(__file__).resolve().parent.parent):
+    if str(project_module_root) not in sys.path:
+        sys.path.insert(0, str(project_module_root))
+
+from expansionstudio.event_maps import (
+    MapEventBundle, MapEventRecord, MapSummary,
+    add_map_script_label, add_map_script_with_text, add_map_text_label,
+    list_event_maps, load_map_event_bundle, rename_map_script_label,
+    save_script_label, save_text_label, search_map_scripts,
+)
+
 try:
     from PySide6.QtCore import QProcess, QProcessEnvironment, QSettings, QTimer, Qt, Signal
     from PySide6.QtGui import QAction, QFont, QIcon, QImage, QKeySequence, QPixmap, QShortcut, QTextCursor
@@ -117,11 +128,15 @@ LANG = {
 LANG["ja"]["index"] = "インデックス"
 LANG["ja"]["rom_layout"] = "ROM Layout"
 LANG["ja"]["rom_binary"] = "ROM Binary"
+LANG["ja"]["info_viewer"] = "Info Viewer"
 LANG["ja"]["maps"] = "Maps / Encounters"
+LANG["ja"]["event_scripts"] = "イベント編集"
 LANG["ja"]["patches"] = "Patches"
 LANG["en"]["rom_layout"] = "ROM Layout"
 LANG["en"]["rom_binary"] = "ROM Binary"
+LANG["en"]["info_viewer"] = "Info Viewer"
 LANG["en"]["maps"] = "Maps / Encounters"
+LANG["en"]["event_scripts"] = "Event Scripts"
 LANG["en"]["patches"] = "Patches"
 
 
@@ -4498,6 +4513,405 @@ class SettingsPanel(QWidget):
             self.window.maybe_auto_open_terminal(force=True)
 
 
+@dataclass
+class InfoViewerChoiceModel:
+    text: str
+    next_id: str
+
+
+@dataclass
+class InfoViewerEntryModel:
+    info_id: str
+    title: str
+    pages: list[str]
+    choices: list[InfoViewerChoiceModel]
+    style: str
+
+
+@dataclass
+class InfoViewerStyleModel:
+    name: str
+    window_fill: str
+    frame_palette_num: str
+    frame_palette: str
+    text_colors: str
+
+
+def info_viewer_symbol_suffix(info_id: str) -> str:
+    return constant_suffix_pascal(info_id, "INFO_")
+
+
+def info_viewer_style_name(value: str) -> str:
+    name = value.strip()
+    if not name:
+        raise ValueError("Style name is empty.")
+    if not name.startswith("sInfoViewerStyle_"):
+        name = "sInfoViewerStyle_" + constant_suffix_pascal(name, "STYLE_")
+    if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", name):
+        raise ValueError("Style name must be a C identifier.")
+    return name
+
+
+def info_viewer_text_for_edit(value: str) -> str:
+    return value.replace(r"\n", "\n")
+
+
+def info_viewer_text_for_source(value: str) -> str:
+    text = value or ""
+    return text if text.lstrip().startswith("{") else "{JPN}" + text
+
+
+def parse_info_viewer_data(root: Path) -> tuple[list[InfoViewerEntryModel], list[InfoViewerStyleModel], str, str]:
+    data_path = root / "src/data/info_viewer.h"
+    constants_path = root / "include/constants/info_viewer.h"
+    source = read_utf8(data_path) if data_path.exists() else ""
+    constants = read_utf8(constants_path) if constants_path.exists() else ""
+    strings: dict[str, str] = {}
+    for match in re.finditer(r"static\s+const\s+u8\s+([A-Za-z_][A-Za-z0-9_]*)\[\]\s*=\s*_\s*\(", source):
+        parsed = parse_c_strings(source, match.end())
+        if parsed:
+            strings[match.group(1)] = info_viewer_text_for_edit(parsed[2])
+    styles: list[InfoViewerStyleModel] = []
+    first_style = re.search(r"static\s+const\s+struct\s+InfoViewerStyle\s+", source)
+    prefix = source[:first_style.start()] if first_style else ""
+    for match in re.finditer(r"static\s+const\s+struct\s+InfoViewerStyle\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*\{", source):
+        open_pos = source.find("{", match.start(), match.end())
+        end = balanced_end(source, open_pos)
+        if end is None:
+            continue
+        block = source[open_pos:end]
+        styles.append(InfoViewerStyleModel(
+            match.group(1),
+            raw_field(block, "windowFill")[2] if raw_field(block, "windowFill") else "PIXEL_FILL(TEXT_COLOR_WHITE)",
+            raw_field(block, "framePaletteNum")[2] if raw_field(block, "framePaletteNum") else "STD_WINDOW_PALETTE_NUM",
+            raw_field(block, "framePalette")[2] if raw_field(block, "framePalette") else "NULL",
+            raw_field(block, "textColors")[2] if raw_field(block, "textColors") else "{ TEXT_COLOR_TRANSPARENT, TEXT_COLOR_DARK_GRAY, TEXT_COLOR_LIGHT_GRAY }",
+        ))
+    pages_by_array: dict[str, list[str]] = {}
+    for match in re.finditer(r"static\s+const\s+u8\s+\*const\s+([A-Za-z_][A-Za-z0-9_]*)\[\]\s*=\s*\{", source):
+        open_pos = source.find("{", match.start(), match.end())
+        end = balanced_end(source, open_pos)
+        if end is None:
+            continue
+        symbols = re.findall(r"\b(sInfoText_[A-Za-z0-9_]+)\b", source[open_pos:end])
+        pages_by_array[match.group(1)] = [strings.get(symbol, symbol) for symbol in symbols]
+    choices_by_array: dict[str, list[InfoViewerChoiceModel]] = {}
+    for match in re.finditer(r"static\s+const\s+struct\s+InfoViewerChoice\s+([A-Za-z_][A-Za-z0-9_]*)\[\]\s*=\s*\{", source):
+        open_pos = source.find("{", match.start(), match.end())
+        end = balanced_end(source, open_pos)
+        if end is None:
+            continue
+        choices: list[InfoViewerChoiceModel] = []
+        for item_match in re.compile(r"\{").finditer(source, open_pos + 1, end - 1):
+            item_end = balanced_end(source, item_match.start())
+            if item_end is None or item_end > end:
+                continue
+            block = source[item_match.start():item_end]
+            text_symbol = raw_field(block, "text")[2] if raw_field(block, "text") else ""
+            next_id = raw_field(block, "nextInfoId")[2] if raw_field(block, "nextInfoId") else "INFO_VIEWER_CLOSE"
+            if text_symbol:
+                choices.append(InfoViewerChoiceModel(strings.get(text_symbol, text_symbol), next_id))
+        choices_by_array[match.group(1)] = choices
+    entries: list[InfoViewerEntryModel] = []
+    entry_match = re.search(r"static\s+const\s+struct\s+InfoViewerEntry\s+sInfoViewerEntries\[INFO_COUNT\]\s*=\s*\{", source)
+    if entry_match:
+        array_open = source.find("{", entry_match.start(), entry_match.end())
+        array_end = balanced_end(source, array_open)
+        if array_end is not None:
+            for match in re.compile(r"\[(INFO_[A-Za-z0-9_]+)\]\s*=\s*\{").finditer(source, array_open, array_end):
+                open_pos = source.find("{", match.start(), match.end())
+                end = balanced_end(source, open_pos)
+                if end is None or end > array_end:
+                    continue
+                block = source[open_pos:end]
+                title_symbol = raw_field(block, "title")[2] if raw_field(block, "title") else ""
+                pages_symbol = raw_field(block, "pages")[2] if raw_field(block, "pages") else ""
+                choices_symbol = raw_field(block, "choices")[2] if raw_field(block, "choices") else "NULL"
+                style_value = raw_field(block, "style")[2] if raw_field(block, "style") else "&sInfoViewerStyle_Default"
+                entries.append(InfoViewerEntryModel(
+                    match.group(1),
+                    strings.get(title_symbol, title_symbol),
+                    pages_by_array.get(pages_symbol, []),
+                    [] if choices_symbol == "NULL" else choices_by_array.get(choices_symbol, []),
+                    style_value.replace("&", "").strip(),
+                ))
+    return entries, styles, source, constants
+
+
+def build_info_viewer_constants(entries: list[InfoViewerEntryModel], newline: str = "\n") -> str:
+    lines = [
+        "#ifndef GUARD_CONSTANTS_INFO_VIEWER_H",
+        "#define GUARD_CONSTANTS_INFO_VIEWER_H",
+        "",
+    ]
+    for index, entry in enumerate(entries):
+        lines.append(f"#define {entry.info_id:<22} {index}")
+    lines.extend([
+        f"#define INFO_COUNT           {len(entries)}",
+        "",
+        "#define INFO_VIEWER_CLOSE    0xFFFE",
+        "#define INFO_VIEWER_BACK     0xFFFF",
+        "",
+        "// Backward-compatible names for the old ultra_help API.",
+        "#define ULTRA_HELP_TOPIC_FRONTIER_RULES INFO_FRONTIER_RULES",
+        "#define ULTRA_HELP_TOPIC_COUNT          INFO_COUNT",
+        "",
+        "#endif // GUARD_CONSTANTS_INFO_VIEWER_H",
+        "",
+    ])
+    return newline.join(lines)
+
+
+def build_info_viewer_data(entries: list[InfoViewerEntryModel], styles: list[InfoViewerStyleModel], prefix: str, newline: str = "\n") -> str:
+    text_defs: list[str] = []
+    page_arrays: list[str] = []
+    choice_arrays: list[str] = []
+    entry_lines: list[str] = []
+    style_lines: list[str] = []
+    for style in styles:
+        style_lines.extend([
+            f"static const struct InfoViewerStyle {style.name} =",
+            "{",
+            f"    .windowFill = {style.window_fill},",
+            f"    .framePaletteNum = {style.frame_palette_num},",
+            f"    .framePalette = {style.frame_palette},",
+            f"    .textColors = {style.text_colors},",
+            "};",
+            "",
+        ])
+    for entry in entries:
+        suffix = info_viewer_symbol_suffix(entry.info_id)
+        title_symbol = f"sInfoText_Title{suffix}"
+        pages_symbol = f"sInfoViewerPages_{suffix}"
+        choices_symbol = f"sInfoViewerChoices_{suffix}"
+        text_defs.append(f"static const u8 {title_symbol}[] = _({quote_c_text(info_viewer_text_for_source(entry.title))});")
+        page_symbols: list[str] = []
+        for index, page in enumerate(entry.pages, 1):
+            symbol = f"sInfoText_{suffix}Page{index}"
+            page_symbols.append(symbol)
+            text_defs.append(f"static const u8 {symbol}[] = _({quote_c_text(info_viewer_text_for_source(page))});")
+        page_arrays.extend([f"static const u8 *const {pages_symbol}[] =", "{"])
+        for symbol in page_symbols:
+            page_arrays.append(f"    {symbol},")
+        page_arrays.extend(["};", ""])
+        if entry.choices:
+            choice_arrays.extend([f"static const struct InfoViewerChoice {choices_symbol}[] =", "{"])
+            for index, choice in enumerate(entry.choices, 1):
+                text_symbol = f"sInfoText_Choice{suffix}{index}"
+                text_defs.append(f"static const u8 {text_symbol}[] = _({quote_c_text(info_viewer_text_for_source(choice.text))});")
+                choice_arrays.extend([
+                    "    {",
+                    f"        .text = {text_symbol},",
+                    f"        .nextInfoId = {choice.next_id},",
+                    "    },",
+                ])
+            choice_arrays.extend(["};", ""])
+        entry_lines.extend([
+            f"    [{entry.info_id}] =",
+            "    {",
+            f"        .title = {title_symbol},",
+            f"        .pages = {pages_symbol},",
+            f"        .pageCount = ARRAY_COUNT({pages_symbol}),",
+            f"        .choices = {choices_symbol if entry.choices else 'NULL'},",
+            f"        .choiceCount = {'ARRAY_COUNT(' + choices_symbol + ')' if entry.choices else '0'},",
+            f"        .style = &{entry.style},",
+            "    },",
+        ])
+    chunks = [prefix.rstrip(), *style_lines, *text_defs, "", *page_arrays, *choice_arrays, "static const struct InfoViewerEntry sInfoViewerEntries[INFO_COUNT] =", "{", *entry_lines, "};", ""]
+    return newline.join(line for line in chunks if line is not None)
+
+
+class InfoViewerPanel(QWidget):
+    """Editor for src/data/info_viewer.h and include/constants/info_viewer.h."""
+    PAGE_SEPARATOR = "\n---\n"
+
+    def __init__(self, window: "Workbench") -> None:
+        super().__init__(); self.window = window; self.entries: list[InfoViewerEntryModel] = []; self.styles: list[InfoViewerStyleModel] = []; self.original_data = ""; self.original_constants = ""; self.current_entry: InfoViewerEntryModel | None = None; self.current_style: InfoViewerStyleModel | None = None; self.loading = False
+        layout = QVBoxLayout(self); split = QSplitter(Qt.Orientation.Horizontal)
+        left = QWidget(); left_layout = QVBoxLayout(left); self.filter = QLineEdit(); self.filter.setPlaceholderText("Filter INFO id / title"); self.filter.textChanged.connect(self.refresh_entries); left_layout.addWidget(self.filter); self.entry_table = QTableWidget(0, 4); self.entry_table.setHorizontalHeaderLabels(["ID", "Title", "Pages", "Choices"]); self.entry_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows); self.entry_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers); self.entry_table.itemSelectionChanged.connect(self.select_entry); left_layout.addWidget(self.entry_table); entry_buttons = QHBoxLayout(); add = QPushButton("Add"); add.clicked.connect(self.add_entry); delete = QPushButton("Delete"); delete.clicked.connect(self.delete_entry); entry_buttons.addWidget(add); entry_buttons.addWidget(delete); left_layout.addLayout(entry_buttons); split.addWidget(left)
+        right = QTabWidget(); entry_tab = QWidget(); entry_layout = QVBoxLayout(entry_tab); form = QFormLayout(); self.entry_id = QLineEdit(); self.entry_title = QLineEdit(); self.entry_style = QComboBox(); self.entry_id.textChanged.connect(self.entry_changed); self.entry_title.textChanged.connect(self.entry_changed); self.entry_style.currentIndexChanged.connect(self.entry_changed); form.addRow("Info ID", self.entry_id); form.addRow("Title", self.entry_title); form.addRow("Style", self.entry_style); entry_layout.addLayout(form); entry_layout.addWidget(QLabel("Pages, separated by a line containing ---")); self.pages = QPlainTextEdit(); self.pages.textChanged.connect(self.entry_changed); entry_layout.addWidget(self.pages)
+        entry_layout.addWidget(QLabel("Choices")); self.choice_table = QTableWidget(0, 2); self.choice_table.setHorizontalHeaderLabels(["Text", "Next ID"]); self.choice_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows); self.choice_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers); self.choice_table.itemSelectionChanged.connect(self.select_choice); entry_layout.addWidget(self.choice_table); choice_row = QHBoxLayout(); self.choice_text = QLineEdit(); self.choice_next = QComboBox(); self.choice_next.setEditable(True); add_choice = QPushButton("Add / Update"); add_choice.clicked.connect(self.add_or_update_choice); del_choice = QPushButton("Delete choice"); del_choice.clicked.connect(self.delete_choice); choice_row.addWidget(self.choice_text); choice_row.addWidget(self.choice_next); choice_row.addWidget(add_choice); choice_row.addWidget(del_choice); entry_layout.addLayout(choice_row); right.addTab(entry_tab, "Entries")
+        style_tab = QWidget(); style_layout = QVBoxLayout(style_tab); self.style_table = QTableWidget(0, 5); self.style_table.setHorizontalHeaderLabels(["Style", "Fill", "Frame Pal", "Palette", "Text Colors"]); self.style_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows); self.style_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers); self.style_table.itemSelectionChanged.connect(self.select_style); style_layout.addWidget(self.style_table); style_form = QFormLayout(); self.style_name = QLineEdit(); self.style_fill = QLineEdit(); self.style_frame_pal = QLineEdit(); self.style_palette = QLineEdit(); self.style_text_colors = QLineEdit(); self.style_name.textChanged.connect(self.style_changed); self.style_fill.textChanged.connect(self.style_changed); self.style_frame_pal.textChanged.connect(self.style_changed); self.style_palette.textChanged.connect(self.style_changed); self.style_text_colors.textChanged.connect(self.style_changed); style_form.addRow("Name", self.style_name); style_form.addRow("Window fill", self.style_fill); style_form.addRow("Frame palette num", self.style_frame_pal); style_form.addRow("Frame palette", self.style_palette); style_form.addRow("Text colors", self.style_text_colors); style_layout.addLayout(style_form); style_buttons = QHBoxLayout(); add_style = QPushButton("Add style"); add_style.clicked.connect(self.add_style); delete_style = QPushButton("Delete style"); delete_style.clicked.connect(self.delete_style); style_buttons.addWidget(add_style); style_buttons.addWidget(delete_style); style_layout.addLayout(style_buttons); right.addTab(style_tab, "Styles")
+        split.addWidget(right); split.setSizes([520, 980]); layout.addWidget(split); buttons = QHBoxLayout(); diff = QPushButton("Diff"); diff.clicked.connect(self.show_diff); save = QPushButton("Save Info Viewer"); save.clicked.connect(self.save); buttons.addStretch(); buttons.addWidget(diff); buttons.addWidget(save); layout.addLayout(buttons)
+
+    def reset_loaded(self) -> None:
+        self.entries.clear(); self.styles.clear(); self.original_data = ""; self.original_constants = ""; self.current_entry = None; self.current_style = None
+
+    def load(self) -> None:
+        if not self.window.root_valid(): return
+        self.entries, self.styles, self.original_data, self.original_constants = parse_info_viewer_data(self.window.root)
+        if not self.styles:
+            self.styles = [InfoViewerStyleModel("sInfoViewerStyle_Default", "PIXEL_FILL(TEXT_COLOR_WHITE)", "STD_WINDOW_PALETTE_NUM", "NULL", "{ TEXT_COLOR_TRANSPARENT, TEXT_COLOR_DARK_GRAY, TEXT_COLOR_LIGHT_GRAY }")]
+        self.refresh_style_combos(); self.refresh_entries(); self.refresh_styles(); self.window.status(f"Loaded {len(self.entries)} Info Viewer entries / {len(self.styles)} styles")
+
+    def refresh_style_combos(self) -> None:
+        current = self.entry_style.currentData() if self.entry_style.count() else ""
+        self.entry_style.blockSignals(True); self.entry_style.clear()
+        for style in self.styles:
+            self.entry_style.addItem(style.name.replace("sInfoViewerStyle_", ""), style.name)
+        index = self.entry_style.findData(current); self.entry_style.setCurrentIndex(index if index >= 0 else 0); self.entry_style.blockSignals(False)
+
+    def refresh_next_choices(self) -> None:
+        current = self.choice_next.currentText()
+        self.choice_next.blockSignals(True); self.choice_next.clear()
+        for value in ["INFO_VIEWER_CLOSE", "INFO_VIEWER_BACK", *[entry.info_id for entry in self.entries]]:
+            self.choice_next.addItem(value, value)
+        self.choice_next.setEditText(current); self.choice_next.blockSignals(False)
+
+    def refresh_entries(self) -> None:
+        query = self.filter.text().casefold().strip(); rows = [entry for entry in self.entries if not query or query in (entry.info_id + " " + entry.title).casefold()]
+        self.entry_table.setRowCount(len(rows))
+        for row, entry in enumerate(rows):
+            values = [entry.info_id, entry.title.replace("\n", r"\n")[:90], str(len(entry.pages)), str(len(entry.choices))]
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(value); item.setData(Qt.ItemDataRole.UserRole, entry); self.entry_table.setItem(row, column, item)
+
+    def refresh_styles(self) -> None:
+        self.style_table.setRowCount(len(self.styles))
+        for row, style in enumerate(self.styles):
+            values = [style.name, style.window_fill, style.frame_palette_num, style.frame_palette, style.text_colors]
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(value); item.setData(Qt.ItemDataRole.UserRole, style); self.style_table.setItem(row, column, item)
+        self.refresh_style_combos(); self.refresh_next_choices()
+
+    def select_entry(self) -> None:
+        self.capture_entry(); selected = self.entry_table.selectedItems()
+        if not selected: return
+        self.current_entry = selected[0].data(Qt.ItemDataRole.UserRole); self.loading = True
+        self.entry_id.setText(self.current_entry.info_id); self.entry_title.setText(self.current_entry.title); self.pages.setPlainText(self.PAGE_SEPARATOR.join(self.current_entry.pages)); index = self.entry_style.findData(self.current_entry.style); self.entry_style.setCurrentIndex(index if index >= 0 else 0); self.refresh_choice_table(); self.loading = False
+
+    def select_style(self) -> None:
+        self.capture_style(); selected = self.style_table.selectedItems()
+        if not selected: return
+        self.current_style = selected[0].data(Qt.ItemDataRole.UserRole); self.loading = True
+        self.style_name.setText(self.current_style.name); self.style_fill.setText(self.current_style.window_fill); self.style_frame_pal.setText(self.current_style.frame_palette_num); self.style_palette.setText(self.current_style.frame_palette); self.style_text_colors.setText(self.current_style.text_colors); self.loading = False
+
+    def refresh_choice_table(self) -> None:
+        choices = self.current_entry.choices if self.current_entry else []
+        self.choice_table.setRowCount(len(choices))
+        for row, choice in enumerate(choices):
+            for column, value in enumerate([choice.text.replace("\n", r"\n")[:110], choice.next_id]):
+                item = QTableWidgetItem(value); item.setData(Qt.ItemDataRole.UserRole, row); self.choice_table.setItem(row, column, item)
+
+    def select_choice(self) -> None:
+        if not self.current_entry: return
+        selected = self.choice_table.selectedItems()
+        if not selected: return
+        choice = self.current_entry.choices[selected[0].data(Qt.ItemDataRole.UserRole)]
+        self.choice_text.setText(choice.text); self.choice_next.setEditText(choice.next_id)
+
+    def entry_pages(self) -> list[str]:
+        return [part.strip("\n") for part in re.split(r"\n---+\n", self.pages.toPlainText()) if part.strip()]
+
+    def capture_entry(self) -> None:
+        if self.loading or not self.current_entry: return
+        self.current_entry.info_id = prefixed_constant(self.entry_id.text(), "INFO_")
+        self.current_entry.title = self.entry_title.text()
+        self.current_entry.pages = self.entry_pages()
+        self.current_entry.style = self.entry_style.currentData() or self.entry_style.currentText()
+
+    def capture_style(self) -> None:
+        if self.loading or not self.current_style: return
+        self.current_style.name = info_viewer_style_name(self.style_name.text())
+        self.current_style.window_fill = self.style_fill.text().strip() or "PIXEL_FILL(TEXT_COLOR_WHITE)"
+        self.current_style.frame_palette_num = self.style_frame_pal.text().strip() or "STD_WINDOW_PALETTE_NUM"
+        self.current_style.frame_palette = self.style_palette.text().strip() or "NULL"
+        self.current_style.text_colors = self.style_text_colors.text().strip() or "{ TEXT_COLOR_TRANSPARENT, TEXT_COLOR_DARK_GRAY, TEXT_COLOR_LIGHT_GRAY }"
+
+    def entry_changed(self) -> None:
+        if not self.loading and self.current_entry:
+            try: self.capture_entry()
+            except ValueError: return
+            self.refresh_entries()
+
+    def style_changed(self) -> None:
+        if not self.loading and self.current_style:
+            try: self.capture_style()
+            except ValueError: return
+            self.refresh_styles()
+
+    def add_or_update_choice(self) -> None:
+        if not self.current_entry: return
+        choice = InfoViewerChoiceModel(self.choice_text.text().strip(), self.choice_next.currentText().strip() or "INFO_VIEWER_CLOSE")
+        if not choice.text: return
+        selected = self.choice_table.selectedItems()
+        if selected: self.current_entry.choices[selected[0].data(Qt.ItemDataRole.UserRole)] = choice
+        else: self.current_entry.choices.append(choice)
+        self.refresh_choice_table(); self.refresh_entries()
+
+    def delete_choice(self) -> None:
+        if not self.current_entry: return
+        selected = self.choice_table.selectedItems()
+        if selected: self.current_entry.choices.pop(selected[0].data(Qt.ItemDataRole.UserRole)); self.refresh_choice_table(); self.refresh_entries()
+
+    def add_entry(self) -> None:
+        raw, ok = QInputDialog.getText(self, "Add Info Viewer", "Info ID (INFO_ optional):")
+        if not ok or not raw.strip(): return
+        try: info_id = prefixed_constant(raw, "INFO_")
+        except ValueError as error: QMessageBox.warning(self, "Invalid ID", str(error)); return
+        if any(entry.info_id == info_id for entry in self.entries): QMessageBox.warning(self, "Duplicate ID", info_id); return
+        style = self.styles[0].name if self.styles else "sInfoViewerStyle_Default"; entry = InfoViewerEntryModel(info_id, display_name_with_jpn(info_id.removeprefix("INFO_").replace("_", " ").title()), ["{JPN}New info page."], [], style); self.entries.append(entry); self.refresh_entries(); self.select_entry_by_id(info_id)
+
+    def delete_entry(self) -> None:
+        if not self.current_entry: return
+        if QMessageBox.question(self, "Delete Info Viewer", f"Delete {self.current_entry.info_id}?") != QMessageBox.StandardButton.Yes: return
+        old = self.current_entry.info_id; self.entries = [entry for entry in self.entries if entry is not self.current_entry]; self.current_entry = None; self.refresh_entries(); self.refresh_next_choices(); self.window.status(f"Deleted Info Viewer entry: {old}")
+
+    def add_style(self) -> None:
+        raw, ok = QInputDialog.getText(self, "Add Info Viewer style", "Style name:")
+        if not ok or not raw.strip(): return
+        try: name = info_viewer_style_name(raw)
+        except ValueError as error: QMessageBox.warning(self, "Invalid style", str(error)); return
+        if any(style.name == name for style in self.styles): QMessageBox.warning(self, "Duplicate style", name); return
+        self.styles.append(InfoViewerStyleModel(name, "PIXEL_FILL(TEXT_COLOR_WHITE)", "STD_WINDOW_PALETTE_NUM", "NULL", "{ TEXT_COLOR_TRANSPARENT, TEXT_COLOR_DARK_GRAY, TEXT_COLOR_LIGHT_GRAY }")); self.refresh_styles()
+
+    def delete_style(self) -> None:
+        if not self.current_style or len(self.styles) <= 1: return
+        name = self.current_style.name
+        if QMessageBox.question(self, "Delete Info Viewer style", f"Delete {name}? Entries using it will move to the first remaining style.") != QMessageBox.StandardButton.Yes: return
+        self.styles = [style for style in self.styles if style is not self.current_style]; fallback = self.styles[0].name
+        for entry in self.entries:
+            if entry.style == name: entry.style = fallback
+        self.current_style = None; self.refresh_styles(); self.refresh_entries()
+
+    def select_entry_by_id(self, info_id: str) -> None:
+        for row in range(self.entry_table.rowCount()):
+            item = self.entry_table.item(row, 0)
+            if item and item.text() == info_id: self.entry_table.selectRow(row); return
+
+    def pending_sources(self) -> tuple[str, str]:
+        self.capture_entry(); self.capture_style()
+        ids = [entry.info_id for entry in self.entries]
+        if len(ids) != len(set(ids)): raise RuntimeError("Duplicate Info Viewer IDs are not allowed.")
+        style_names = [style.name for style in self.styles]
+        if len(style_names) != len(set(style_names)): raise RuntimeError("Duplicate Info Viewer style names are not allowed.")
+        missing = [entry.style for entry in self.entries if entry.style not in style_names]
+        if missing: raise RuntimeError("Unknown style reference: " + ", ".join(sorted(set(missing))))
+        if any(not entry.pages for entry in self.entries): raise RuntimeError("Every Info Viewer entry needs at least one page.")
+        first_style = re.search(r"static\s+const\s+struct\s+InfoViewerStyle\s+", self.original_data)
+        prefix = self.original_data[:first_style.start()] if first_style else ""
+        data_newline = source_newline(self.original_data) if self.original_data else "\n"
+        constants_newline = source_newline(self.original_constants) if self.original_constants else "\n"
+        return build_info_viewer_data(self.entries, self.styles, prefix, data_newline), build_info_viewer_constants(self.entries, constants_newline)
+
+    def show_diff(self) -> None:
+        try: data_source, constants_source = self.pending_sources()
+        except RuntimeError as error: QMessageBox.warning(self, "Invalid Info Viewer data", str(error)); return
+        before = self.original_data + "\n/* constants */\n" + self.original_constants
+        after = data_source + "\n/* constants */\n" + constants_source
+        DiffDialog(self, "Diff: Info Viewer", before, after).exec()
+
+    def save(self) -> None:
+        data_path = self.window.root / "src/data/info_viewer.h"; constants_path = self.window.root / "include/constants/info_viewer.h"
+        try:
+            data_source, constants_source = self.pending_sources()
+            if read_utf8(data_path) != self.original_data or read_utf8(constants_path) != self.original_constants: raise RuntimeError("Info Viewer files changed on disk; reload before saving.")
+            write_with_backup(data_path, data_source); write_with_backup(constants_path, constants_source)
+        except (OSError, RuntimeError, ValueError) as error:
+            QMessageBox.critical(self, "Info Viewer save failed", str(error)); return
+        selected = self.current_entry.info_id if self.current_entry else ""; self.load(); self.select_entry_by_id(selected); self.window.status("Saved Info Viewer data with backups")
+
+
 TYPE_LABELS = {
     "TYPE_NONE": "なし", "TYPE_NORMAL": "ノーマル", "TYPE_FIGHTING": "かくとう",
     "TYPE_FLYING": "ひこう", "TYPE_POISON": "どく", "TYPE_GROUND": "じめん",
@@ -5652,6 +6066,394 @@ class TrainerPartyMonBlock:
     species: str
     level: str
     item: str
+
+
+def event_label_prefix(map_name: str) -> str:
+    cleaned = re.sub(r"\W+", "_", map_name).strip("_")
+    return cleaned or "Map"
+
+
+class MapLabelAddDialog(QDialog):
+    def __init__(self, parent: QWidget, map_name: str) -> None:
+        super().__init__(parent); self.setWindowTitle("新規ラベル追加"); self.resize(720, 560)
+        prefix = event_label_prefix(map_name)
+        layout = QVBoxLayout(self); form = QFormLayout()
+        self.mode = QComboBox(); self.mode.addItem("script と text を同時追加", "both"); self.mode.addItem("text label のみ追加", "text"); self.mode.addItem("script label のみ追加", "script"); self.mode.currentIndexChanged.connect(self.update_state); form.addRow("追加モード", self.mode)
+        self.script_label = QLineEdit(f"{prefix}_EventScript_NewNpc"); form.addRow("script label", self.script_label)
+        self.text_label = QLineEdit(f"{prefix}_Text_NewNpc"); form.addRow("text label", self.text_label)
+        self.template = QComboBox()
+        for label, key in (("msgboxのみ", "msgbox"), ("lock/faceplayer/msgbox/release/end", "talk"), ("yes/no選択", "yes_no"), ("shop風", "shop"), ("BPショップ風", "bp_shop")):
+            self.template.addItem(label, key)
+        self.template.setCurrentIndex(1); form.addRow("テンプレート", self.template)
+        layout.addLayout(form)
+        layout.addWidget(QLabel("text本文"))
+        self.text_body = QPlainTextEdit(); self.text_body.setPlainText("テキスト"); layout.addWidget(self.text_body)
+        layout.addWidget(QLabel("script本文を直接指定する場合のみ入力（空ならテンプレート生成）"))
+        self.script_body = QPlainTextEdit(); self.script_body.setMaximumHeight(130); layout.addWidget(self.script_body)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel); buttons.accepted.connect(self.accept); buttons.rejected.connect(self.reject); layout.addWidget(buttons); self.update_state()
+
+    def update_state(self) -> None:
+        mode = self.mode.currentData()
+        self.script_label.setEnabled(mode in {"both", "script"})
+        self.template.setEnabled(mode in {"both", "script"})
+        self.script_body.setEnabled(mode == "script")
+        self.text_label.setEnabled(mode in {"both", "text", "script"})
+        self.text_body.setEnabled(mode in {"both", "text"})
+
+    def values(self) -> dict[str, str]:
+        return {
+            "mode": str(self.mode.currentData()),
+            "script_label": self.script_label.text().strip(),
+            "text_label": self.text_label.text().strip(),
+            "template": str(self.template.currentData()),
+            "text": self.text_body.toPlainText(),
+            "body": self.script_body.toPlainText(),
+        }
+
+
+class MapScriptSearchDialog(QDialog):
+    def __init__(self, parent: QWidget, panel: "MapEventScriptPanel") -> None:
+        super().__init__(parent)
+        self.panel = panel
+        self.setWindowTitle("Script Search")
+        self.resize(980, 560)
+        layout = QVBoxLayout(self)
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Search"))
+        self.query = QLineEdit()
+        self.query.returnPressed.connect(self.run_search)
+        row.addWidget(self.query)
+        self.current_map_only = QCheckBox("current map only")
+        self.current_map_only.setChecked(bool(panel.current_map))
+        row.addWidget(self.current_map_only)
+        search_button = QPushButton("Search")
+        search_button.clicked.connect(self.run_search)
+        row.addWidget(search_button)
+        layout.addLayout(row)
+        self.count_label = QLabel("")
+        layout.addWidget(self.count_label)
+        self.table = QTableWidget(0, 7)
+        self.table.setHorizontalHeaderLabels(["Map", "Label", "Line", "Refs", "Texts", "File", "Preview"])
+        self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.table.itemDoubleClicked.connect(self.open_selected)
+        configure_table(self.table)
+        for column, width in enumerate([180, 260, 70, 60, 180, 260, 420]):
+            self.table.setColumnWidth(column, width)
+        layout.addWidget(self.table)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        open_button = QPushButton("Open")
+        open_button.clicked.connect(self.open_selected)
+        buttons.addButton(open_button, QDialogButtonBox.ButtonRole.ActionRole)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+        self.run_search()
+
+    def run_search(self) -> None:
+        query = self.query.text().strip()
+        map_name = self.panel.current_map if self.current_map_only.isChecked() and self.panel.current_map else None
+        try:
+            results = search_map_scripts(self.panel.window.root, query, map_name, include_body=False)
+        except Exception as error:
+            QMessageBox.critical(self, "Script search failed", str(error))
+            return
+        self.table.setRowCount(0)
+        for result in results:
+            row = self.table.rowCount()
+            self.table.insertRow(row)
+            values = [
+                result.get("map", ""),
+                result.get("label", ""),
+                result.get("line", ""),
+                result.get("event_refs", ""),
+                ", ".join(result.get("text_labels", [])),
+                result.get("file", ""),
+                result.get("preview", ""),
+            ]
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(str(value))
+                item.setData(Qt.ItemDataRole.UserRole, result)
+                self.table.setItem(row, column, item)
+        self.count_label.setText(f"{len(results)} scripts")
+        if results:
+            self.table.selectRow(0)
+
+    def open_selected(self, *_args: object) -> None:
+        row = self.table.currentRow()
+        if row < 0:
+            return
+        item = self.table.item(row, 0)
+        result = item.data(Qt.ItemDataRole.UserRole) if item else None
+        if not isinstance(result, dict):
+            return
+        map_name = str(result.get("map", ""))
+        label = str(result.get("label", ""))
+        if not map_name or not label:
+            return
+        self.panel.load_map(map_name)
+        self.panel.show_script_label(label)
+        self.accept()
+
+
+class MapEventScriptPanel(QWidget):
+    """Map event/script/text viewer backed by Qt-free event_maps helpers."""
+    def __init__(self, window: "Workbench") -> None:
+        super().__init__(); self.window = window; self.loading = False
+        self.maps: list[MapSummary] = []; self.bundle: MapEventBundle | None = None; self.current_map = ""; self.current_event: MapEventRecord | None = None; self.current_script_label = ""; self.current_text_label = ""
+        self.build()
+
+    @staticmethod
+    def set_columns(table: QTableWidget, widths: list[int]) -> None:
+        for index, width in enumerate(widths):
+            table.setColumnWidth(index, width)
+
+    def build(self) -> None:
+        layout = QVBoxLayout(self)
+        top = QHBoxLayout(); top.addWidget(QLabel("Map filter")); self.map_filter = QLineEdit(); self.map_filter.textChanged.connect(self.refresh_maps); top.addWidget(self.map_filter); self.add_label_button = QPushButton("新規ラベル追加"); self.add_label_button.clicked.connect(self.add_label); top.addWidget(self.add_label_button); self.search_script_button = QPushButton("Script Search"); self.search_script_button.clicked.connect(self.search_scripts); top.addWidget(self.search_script_button); self.rename_script_button = QPushButton("Rename Script"); self.rename_script_button.clicked.connect(self.rename_script); top.addWidget(self.rename_script_button); self.reload_button = QPushButton("Reload"); self.reload_button.clicked.connect(self.load); top.addWidget(self.reload_button); layout.addLayout(top)
+        split = QSplitter(Qt.Orientation.Horizontal); layout.addWidget(split)
+        left = QWidget(); left_layout = QVBoxLayout(left); left_layout.addWidget(QLabel("Maps"))
+        self.map_table = QTableWidget(0, 7); self.map_table.setHorizontalHeaderLabels(["Map", "ID", "Obj", "Warp", "Coord", "BG", "text.inc"]); self.map_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows); self.map_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers); self.map_table.itemSelectionChanged.connect(self.select_map); configure_table(self.map_table); self.set_columns(self.map_table, [230, 240, 54, 62, 70, 54, 84]); left_layout.addWidget(self.map_table); split.addWidget(left)
+        right = QWidget(); right_layout = QVBoxLayout(right)
+        self.map_detail = QLabel("No map selected"); self.map_detail.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse); right_layout.addWidget(self.map_detail)
+        self.event_tabs = QTabWidget(); self.object_table = self.make_event_table(); self.warp_table = self.make_event_table(); self.coord_table = self.make_event_table(); self.bg_table = self.make_event_table(); self.event_tabs.addTab(self.object_table, "Object events"); self.event_tabs.addTab(self.warp_table, "Warps"); self.event_tabs.addTab(self.coord_table, "Coord events"); self.event_tabs.addTab(self.bg_table, "BG events"); right_layout.addWidget(self.event_tabs)
+        detail_split = QSplitter(Qt.Orientation.Horizontal)
+        script_box = QGroupBox("Script"); script_layout = QVBoxLayout(script_box); self.script_label = QLineEdit(); self.script_label.setReadOnly(True); script_layout.addWidget(self.script_label); self.script_editor = QPlainTextEdit(); self.script_editor.setEnabled(False); script_layout.addWidget(self.script_editor); script_buttons = QHBoxLayout(); self.script_diff = QPushButton("Script diff"); self.script_diff.clicked.connect(self.show_script_diff); self.script_save = QPushButton("Save script"); self.script_save.clicked.connect(self.save_script); script_buttons.addStretch(); script_buttons.addWidget(self.script_diff); script_buttons.addWidget(self.script_save); script_layout.addLayout(script_buttons); detail_split.addWidget(script_box)
+        text_box = QGroupBox("Text"); text_layout = QVBoxLayout(text_box); self.text_labels = QListWidget(); self.text_labels.itemSelectionChanged.connect(self.select_text_label); text_layout.addWidget(self.text_labels); self.text_detail = QLabel("No text selected"); self.text_detail.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse); text_layout.addWidget(self.text_detail); self.text_editor = QPlainTextEdit(); self.text_editor.setEnabled(False); text_layout.addWidget(self.text_editor); text_buttons = QHBoxLayout(); self.text_diff = QPushButton("Text diff"); self.text_diff.clicked.connect(self.show_text_diff); self.text_save = QPushButton("Save text"); self.text_save.clicked.connect(self.save_text); text_buttons.addStretch(); text_buttons.addWidget(self.text_diff); text_buttons.addWidget(self.text_save); text_layout.addLayout(text_buttons); detail_split.addWidget(text_box)
+        detail_split.setSizes([760, 540]); right_layout.addWidget(detail_split); self.warning_label = QLabel(""); self.warning_label.setWordWrap(True); right_layout.addWidget(self.warning_label)
+        split.addWidget(right); split.setSizes([520, 1060])
+
+    def make_event_table(self) -> QTableWidget:
+        table = QTableWidget(0, 7); table.setHorizontalHeaderLabels(["#", "Name", "X", "Y", "Script", "Texts", "Status"]); table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows); table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers); table.itemSelectionChanged.connect(self.select_event); configure_table(table); self.set_columns(table, [42, 210, 52, 52, 330, 180, 110]); return table
+
+    def retranslate(self) -> None:
+        pass
+
+    def reset_loaded(self) -> None:
+        self.maps = []; self.bundle = None; self.current_map = ""; self.current_event = None; self.current_script_label = ""; self.current_text_label = ""; self.map_table.setRowCount(0); self.clear_event_tables(); self.clear_detail()
+
+    def load(self) -> None:
+        self.maps = list_event_maps(self.window.root); self.refresh_maps()
+        if self.current_map:
+            self.load_map(self.current_map)
+        elif self.maps:
+            self.map_table.selectRow(0)
+        self.window.status(f"Event maps: {len(self.maps)}")
+
+    def refresh_maps(self) -> None:
+        query = self.map_filter.text().strip().casefold() if hasattr(self, "map_filter") else ""; selected = self.current_map
+        self.loading = True; self.map_table.setRowCount(0)
+        for entry in self.maps:
+            haystack = f"{entry.name} {entry.map_id} {entry.file_name}".casefold()
+            if query and query not in haystack:
+                continue
+            row = self.map_table.rowCount(); self.map_table.insertRow(row); values = [entry.name, entry.map_id, entry.object_count, entry.warp_count, entry.coord_count, entry.bg_count, "yes" if entry.has_text else "no"]
+            for col, value in enumerate(values):
+                item = QTableWidgetItem(str(value)); item.setData(Qt.ItemDataRole.UserRole, entry.name); self.map_table.setItem(row, col, item)
+            if entry.name == selected:
+                self.map_table.selectRow(row)
+        self.loading = False
+
+    def select_map(self) -> None:
+        if self.loading:
+            return
+        row = self.map_table.currentRow()
+        if row < 0:
+            return
+        item = self.map_table.item(row, 0)
+        if not item:
+            return
+        name = item.data(Qt.ItemDataRole.UserRole) or item.text(); self.load_map(str(name))
+
+    def load_map(self, name: str) -> None:
+        try:
+            self.bundle = load_map_event_bundle(self.window.root, name)
+        except Exception as error:
+            QMessageBox.critical(self, "Map event load failed", str(error)); return
+        self.current_map = name; bundle = self.bundle; text_file = rel(self.window.root, bundle.text_path) if bundle.text_path else "scripts.inc"
+        self.map_detail.setText(f"{bundle.map_name} | {bundle.map_id}\n{rel(self.window.root, bundle.map_json)} | scripts: {rel(self.window.root, bundle.scripts_path)} | text: {text_file}")
+        self.populate_events(self.object_table, bundle.object_events); self.populate_events(self.warp_table, bundle.warp_events); self.populate_events(self.coord_table, bundle.coord_events); self.populate_events(self.bg_table, bundle.bg_events)
+        self.warning_label.setText("\n".join(bundle.warnings)); self.clear_detail()
+        if bundle.object_events:
+            self.event_tabs.setCurrentWidget(self.object_table); self.object_table.selectRow(0)
+
+    def add_label(self) -> None:
+        if not self.current_map:
+            row = self.map_table.currentRow()
+            if row >= 0 and self.map_table.item(row, 0):
+                self.current_map = str(self.map_table.item(row, 0).data(Qt.ItemDataRole.UserRole) or self.map_table.item(row, 0).text())
+        if not self.current_map:
+            self.window.status("No map selected"); return
+        dialog = MapLabelAddDialog(self, self.current_map)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        values = dialog.values()
+        try:
+            if values["mode"] == "text":
+                result = add_map_text_label(self.window.root, self.current_map, values["text_label"], values["text"])
+                self.load_map(self.current_map); self.show_text_label(result["label"])
+            elif values["mode"] == "script":
+                body = values["body"] if values["body"].strip() else None
+                result = add_map_script_label(self.window.root, self.current_map, values["script_label"], body, values["template"], values["text_label"])
+                self.load_map(self.current_map); self.show_script_label(result["label"])
+                if result.get("warnings"):
+                    QMessageBox.warning(self, "Script added with warnings", "Undefined text labels:\n" + "\n".join(result["warnings"]))
+            else:
+                result = add_map_script_with_text(self.window.root, self.current_map, values["script_label"], values["text_label"], values["text"], values["template"])
+                self.load_map(self.current_map); self.show_script_label(result["script"]["label"]); self.show_text_label(result["text"]["label"])
+            self.window.status("Added event label")
+        except Exception as error:
+            QMessageBox.critical(self, "Add label failed", str(error))
+
+    def search_scripts(self) -> None:
+        MapScriptSearchDialog(self, self).exec()
+
+    def rename_script(self) -> None:
+        if not self.current_map or not self.current_script_label:
+            self.window.status("No event script selected"); return
+        old_label = self.current_script_label
+        new_label, ok = QInputDialog.getText(self, "Rename Script", "New script label", text=old_label)
+        if not ok:
+            return
+        new_label = new_label.strip()
+        if not new_label or new_label == old_label:
+            return
+        try:
+            result = rename_map_script_label(self.window.root, self.current_map, old_label, new_label)
+        except Exception as error:
+            QMessageBox.critical(self, "Script rename failed", str(error)); return
+        self.load_map(self.current_map); self.show_script_label(result["new_label"])
+        self.window.status(f"Renamed event script: {old_label} -> {new_label}")
+
+    def clear_event_tables(self) -> None:
+        for table in (self.object_table, self.warp_table, self.coord_table, self.bg_table):
+            table.setRowCount(0)
+
+    def populate_events(self, table: QTableWidget, events: list[MapEventRecord]) -> None:
+        table.setRowCount(0)
+        for event in events:
+            row = table.rowCount(); table.insertRow(row)
+            status = "OK" if event.script_found or not event.script_label or event.script_label == "0x0" else "script missing"
+            if event.missing_text_labels:
+                status = "text missing"
+            values = [event.index, event.name, event.x, event.y, event.script_label, ", ".join(event.text_labels), status]
+            for col, value in enumerate(values):
+                item = QTableWidgetItem(str(value)); item.setData(Qt.ItemDataRole.UserRole, event); table.setItem(row, col, item)
+
+    def select_event(self) -> None:
+        table = self.sender()
+        if not isinstance(table, QTableWidget) or self.bundle is None:
+            return
+        row = table.currentRow()
+        if row < 0:
+            return
+        item = table.item(row, 0); event = item.data(Qt.ItemDataRole.UserRole) if item else None
+        if isinstance(event, MapEventRecord):
+            self.show_event(event)
+
+    def clear_detail(self) -> None:
+        self.current_event = None; self.current_script_label = ""; self.current_text_label = ""; self.script_label.clear(); self.script_editor.clear(); self.script_editor.setEnabled(False); self.text_labels.clear(); self.text_detail.setText("No text selected"); self.text_editor.clear(); self.text_editor.setEnabled(False)
+
+    def show_event(self, event: MapEventRecord) -> None:
+        if self.bundle is None:
+            return
+        self.current_event = event; self.current_script_label = event.script_label; self.current_text_label = ""; self.script_label.setText(event.script_label)
+        script = self.bundle.scripts.get(event.script_label); self.script_editor.setEnabled(script is not None); self.script_editor.setPlainText(script.body if script else "")
+        self.text_labels.clear()
+        for label in event.text_labels:
+            item = QListWidgetItem(label); item.setData(Qt.ItemDataRole.UserRole, label); self.text_labels.addItem(item)
+        if event.text_labels:
+            self.text_labels.setCurrentRow(0)
+        else:
+            self.text_detail.setText("No msgbox/message text detected"); self.text_editor.clear(); self.text_editor.setEnabled(False)
+        if event.missing_text_labels:
+            self.warning_label.setText("Missing text labels: " + ", ".join(event.missing_text_labels))
+
+    def show_script_label(self, script_label: str) -> None:
+        if self.bundle is None:
+            return
+        self.current_event = None; self.current_script_label = script_label; self.current_text_label = ""; self.script_label.setText(script_label)
+        script = self.bundle.scripts.get(script_label)
+        self.script_editor.setEnabled(script is not None); self.script_editor.setPlainText(script.body if script else "")
+        self.text_labels.clear()
+        if script:
+            for label in script.text_labels:
+                item = QListWidgetItem(label); item.setData(Qt.ItemDataRole.UserRole, label); self.text_labels.addItem(item)
+            if script.text_labels:
+                self.text_labels.setCurrentRow(0)
+        if not script or not script.text_labels:
+            self.text_detail.setText("No msgbox/message text detected"); self.text_editor.clear(); self.text_editor.setEnabled(False)
+
+    def show_text_label(self, text_label: str) -> None:
+        if self.bundle is None:
+            return
+        self.text_labels.clear(); item = QListWidgetItem(text_label); item.setData(Qt.ItemDataRole.UserRole, text_label); self.text_labels.addItem(item); self.text_labels.setCurrentRow(0)
+
+    def select_text_label(self) -> None:
+        if self.bundle is None:
+            return
+        item = self.text_labels.currentItem(); label = str(item.data(Qt.ItemDataRole.UserRole) or item.text()) if item else ""; self.current_text_label = label
+        text = self.bundle.texts.get(label); self.text_editor.setEnabled(text is not None)
+        if text:
+            suffix = "  ($ is preserved on save)" if text.has_terminator else ""; self.text_detail.setText(f"{text.label}{suffix}\n{text.file}:{text.line}"); self.text_editor.setPlainText(text.text)
+        else:
+            self.text_detail.setText(f"{label}\nText label was not found."); self.text_editor.clear()
+
+    def current_text_original(self) -> str:
+        if not self.bundle or not self.current_text_label:
+            return ""
+        text = self.bundle.texts.get(self.current_text_label); return text.text if text else ""
+
+    def current_script_original(self) -> str:
+        if not self.bundle or not self.current_script_label:
+            return ""
+        script = self.bundle.scripts.get(self.current_script_label); return script.body if script else ""
+
+    def save_text(self) -> None:
+        if not self.current_map or not self.current_text_label:
+            self.window.status("No event text selected"); return
+        try:
+            result = save_text_label(self.window.root, self.current_map, self.current_text_label, self.text_editor.toPlainText())
+        except Exception as error:
+            QMessageBox.critical(self, "Event text save failed", str(error)); return
+        current_event = self.current_event.script_label if self.current_event else ""; self.load_map(self.current_map); self.reselect_event(current_event); self.window.status(f"Saved event text: {result['label']}")
+
+    def save_script(self) -> None:
+        if not self.current_map or not self.current_script_label:
+            self.window.status("No event script selected"); return
+        try:
+            result = save_script_label(self.window.root, self.current_map, self.current_script_label, self.script_editor.toPlainText())
+        except Exception as error:
+            QMessageBox.critical(self, "Event script save failed", str(error)); return
+        if result.get("warnings"):
+            QMessageBox.warning(self, "Script saved with warnings", "Undefined text labels:\n" + "\n".join(result["warnings"]))
+        self.load_map(self.current_map); self.reselect_event(result["label"]); self.window.status(f"Saved event script: {result['label']}")
+
+    def reselect_event(self, script_label: str) -> None:
+        if not script_label:
+            return
+        for table in (self.object_table, self.coord_table, self.bg_table):
+            for row in range(table.rowCount()):
+                event = table.item(row, 0).data(Qt.ItemDataRole.UserRole)
+                if isinstance(event, MapEventRecord) and event.script_label == script_label:
+                    self.event_tabs.setCurrentWidget(table); table.selectRow(row); return
+
+    def show_text_diff(self) -> None:
+        if not self.current_text_label:
+            self.window.status("No event text selected"); return
+        DiffDialog(self, f"Diff: {self.current_text_label}", self.current_text_original(), self.text_editor.toPlainText()).exec()
+
+    def show_script_diff(self) -> None:
+        if not self.current_script_label:
+            self.window.status("No event script selected"); return
+        DiffDialog(self, f"Diff: {self.current_script_label}", self.current_script_original(), self.script_editor.toPlainText()).exec()
+
+    def show_diff(self) -> None:
+        if self.text_editor.hasFocus(): self.show_text_diff()
+        else: self.show_script_diff()
+
+    def save(self) -> None:
+        if self.text_editor.hasFocus(): self.save_text()
+        else: self.save_script()
 
 
 class MapEncounterPanel(QWidget):
@@ -7735,8 +8537,8 @@ class Workbench(QMainWindow):
         super().__init__(); self.settings = QSettings("PokemonDecompTools", "ExpansionStudio"); self.lang = self.settings.value("ui/language", "ja"); self.root = Path(self.settings.value("repo/root", str(Path.cwd()))); self.tool_dir = writable_tool_dir(); self.process: QProcess | None = None; self.command_log: QDialog | None = None
         self.loaded_panels: set[str] = set(); self.loading_depth = 0; self.auto_terminal_key = ""
         self.setStatusBar(QStatusBar()); self.make_toolbar(); self.loading_label = QLabel("読み込み中..."); self.loading_label.setVisible(False); self.statusBar().addPermanentWidget(self.loading_label); self.tabs = QTabWidget(); self.setCentralWidget(self.tabs)
-        self.translation = TranslationPanel(self); self.constants = ConstantsPanel(self); self.files = FileSearchPanel(self); self.index = CodeIndexPanel(self); self.rom_layout = RomLayoutPanel(self); self.rom_binary = RomBinaryViewerPanel(self); self.patches = PatchCreatorPanel(self); self.species = PokemonStudioPanel(self); self.moves = MoveStudioPanel(self); self.maps = MapEncounterPanel(self); self.frontier = BattleFrontierPanel(self); self.assets = AssetPanel(self); self.dependencies = DependencyPanel(self); self.fonts = FontPanel(self); self.poryscript = PoryscriptPanel(self); self.tool_settings = SettingsPanel(self)
-        self.panels: list[tuple[str, QWidget, Callable[[], None] | None]] = [("translation", self.translation, self.translation.load), ("constants", self.constants, self.constants.load), ("files", self.files, None), ("index", self.index, self.index.load), ("rom_layout", self.rom_layout, self.rom_layout.load), ("rom_binary", self.rom_binary, self.rom_binary.load), ("patches", self.patches, None), ("species", self.species, self.species.load), ("moves", self.moves, self.moves.load), ("maps", self.maps, self.maps.load), ("frontier", self.frontier, self.frontier.load), ("assets", self.assets, self.assets.load), ("dependencies", self.dependencies, None), ("fonts", self.fonts, self.fonts.load), ("poryscript", self.poryscript, self.poryscript.load), ("settings", self.tool_settings, self.tool_settings.load)]
+        self.translation = TranslationPanel(self); self.constants = ConstantsPanel(self); self.files = FileSearchPanel(self); self.index = CodeIndexPanel(self); self.rom_layout = RomLayoutPanel(self); self.rom_binary = RomBinaryViewerPanel(self); self.patches = PatchCreatorPanel(self); self.info_viewer = InfoViewerPanel(self); self.species = PokemonStudioPanel(self); self.moves = MoveStudioPanel(self); self.event_scripts = MapEventScriptPanel(self); self.maps = MapEncounterPanel(self); self.frontier = BattleFrontierPanel(self); self.assets = AssetPanel(self); self.dependencies = DependencyPanel(self); self.fonts = FontPanel(self); self.poryscript = PoryscriptPanel(self); self.tool_settings = SettingsPanel(self)
+        self.panels: list[tuple[str, QWidget, Callable[[], None] | None]] = [("translation", self.translation, self.translation.load), ("constants", self.constants, self.constants.load), ("files", self.files, None), ("index", self.index, self.index.load), ("rom_layout", self.rom_layout, self.rom_layout.load), ("rom_binary", self.rom_binary, self.rom_binary.load), ("patches", self.patches, None), ("info_viewer", self.info_viewer, self.info_viewer.load), ("species", self.species, self.species.load), ("moves", self.moves, self.moves.load), ("event_scripts", self.event_scripts, self.event_scripts.load), ("maps", self.maps, self.maps.load), ("frontier", self.frontier, self.frontier.load), ("assets", self.assets, self.assets.load), ("dependencies", self.dependencies, None), ("fonts", self.fonts, self.fonts.load), ("poryscript", self.poryscript, self.poryscript.load), ("settings", self.tool_settings, self.tool_settings.load)]
         for key, panel, _loader in self.panels: self.tabs.addTab(panel, tr(key, self.lang))
         self.tabs.currentChanged.connect(lambda _index: self.load_current())
         self.retranslate(); self.apply_readability_style(); self.resize(1580, 960)

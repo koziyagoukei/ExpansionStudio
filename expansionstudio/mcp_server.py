@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import argparse
 import json
@@ -12,7 +12,7 @@ from typing import Any
 
 
 SERVER_NAME = "expansionstudio"
-SERVER_VERSION = "0.1.0"
+SERVER_VERSION = "0.1.1-beta"
 PROTOCOL_VERSION = "2024-11-05"
 PACKAGE_PARENT = Path(__file__).resolve().parent.parent
 
@@ -68,6 +68,35 @@ TOOLS: dict[str, ToolSpec] = {
     "scan_texts": ToolSpec(
         "scan_texts", "scan-texts", "List translation target strings from src/include.",
         object_schema({"query": {"type": "string"}}),
+    ),
+    "analyze_png": ToolSpec(
+        "analyze_png", "analyze-png", "Analyze a PNG for GBA asset palette suitability.",
+        object_schema({
+            "png": {"type": "string", "description": "Project-relative input PNG."},
+        }, ["png"]),
+    ),
+    "png_to_indexed": ToolSpec(
+        "png_to_indexed", "png-to-indexed", "Convert a PNG to indexed PNG.",
+        object_schema({
+            "png": {"type": "string", "description": "Project-relative input PNG."},
+            "output": {"type": "string", "description": "Project-relative output PNG."},
+            "colors": {"type": "integer", "enum": [16, 224, 256]},
+            "base_pal": {"type": "string", "description": "Optional project-relative JASC-PAL file to prefer for palette order."},
+            "no_quantize": {"type": "boolean"},
+            **COMMON_CONFIRM,
+        }, ["png", "output", "colors", "confirm"]),
+        write=True,
+    ),
+    "png_to_jasc_pal": ToolSpec(
+        "png_to_jasc_pal", "png-to-jasc-pal", "Generate a JASC-PAL .pal file from a PNG.",
+        object_schema({
+            "png": {"type": "string", "description": "Project-relative input PNG."},
+            "output": {"type": "string", "description": "Project-relative output .pal."},
+            "colors": {"type": "integer", "enum": [16, 224, 256]},
+            "base_pal": {"type": "string", "description": "Optional project-relative JASC-PAL file to prefer for palette order."},
+            **COMMON_CONFIRM,
+        }, ["png", "output", "colors", "confirm"]),
+        write=True,
     ),
     "update_text": ToolSpec(
         "update_text", "update-text", "Update one translation target string selected by file and line or symbol.",
@@ -241,7 +270,7 @@ def sanitize_arguments(root: Path, spec: ToolSpec, arguments: dict[str, Any]) ->
                 "This tool writes files or runs a write-capable command. Set confirm=true, or keep dry_run=true when supported.",
                 {"tool": spec.name, "dry_run_supported": spec.dry_run_supported},
             )
-    for field in ("file", "source"):
+    for field in ("file", "source", "png", "output", "base_pal"):
         value = args.get(field)
         if isinstance(value, str):
             ensure_inside_root(root, value, field)
@@ -272,6 +301,19 @@ def build_cli_command(python: str, root: Path, spec: ToolSpec, args: dict[str, A
         append_arg(command, "--query", args.get("query"))
         append_arg(command, "--map", args.get("map"))
         append_arg(command, "--include-bodies", args.get("include_bodies"))
+    elif spec.cli_command == "analyze-png":
+        append_arg(command, "--png", args.get("png"))
+    elif spec.cli_command == "png-to-indexed":
+        append_arg(command, "--png", args.get("png"))
+        append_arg(command, "--output", args.get("output"))
+        append_arg(command, "--colors", args.get("colors"))
+        append_arg(command, "--base-pal", args.get("base_pal"))
+        append_arg(command, "--no-quantize", args.get("no_quantize"))
+    elif spec.cli_command == "png-to-jasc-pal":
+        append_arg(command, "--png", args.get("png"))
+        append_arg(command, "--output", args.get("output"))
+        append_arg(command, "--colors", args.get("colors"))
+        append_arg(command, "--base-pal", args.get("base_pal"))
     elif spec.cli_command in {"import-frontier-pool", "import-monpool", "build"}:
         append_arg(command, "--dry-run", args.get("dry_run"))
     if spec.cli_command == "import-monpool":

@@ -16,9 +16,9 @@ It is an experimental alpha tool. It edits source files directly, so keep your p
 - Pokemon data browser/editor
 - Move data browser/editor
 - Battle Frontier Pokemon pool editor
-- General trainer and trainer party editor
+- General trainer and trainer party editor, including Mugshot cut-in and team transition helper fields
 - Map encounter editor
-- Asset browser and image/palette replacement helper
+- Asset browser, image/palette replacement helper, PNG analysis, indexed PNG conversion, and JASC-PAL generation
 - Glyph Table editor for charmap/glyph inspection
 - Font management helper
 - Info Viewer editor

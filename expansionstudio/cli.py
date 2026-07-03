@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import sys
 import time
+import zlib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -14,6 +15,7 @@ from typing import Any
 from .event_maps import bundle_to_dict, list_event_maps, load_map_event_bundle
 from .event_maps import add_map_script_label, add_map_script_with_text, add_map_text_label
 from .event_maps import rename_map_script_label, save_script_label, save_text_label, search_map_scripts
+from .palette import PaletteError, analyze_png, write_indexed_png_from_png, write_jasc_pal_from_png
 
 
 TEXT_EXTENSIONS = {".c", ".h", ".inc"}
@@ -543,6 +545,16 @@ def resolve_project_file(root: Path, file_name: str) -> Path:
     return path
 
 
+def resolve_project_output(root: Path, file_name: str) -> Path:
+    path = (root / file_name).resolve()
+    root_resolved = root.resolve()
+    try:
+        path.relative_to(root_resolved)
+    except ValueError as error:
+        raise CliError("path_outside_root", "Output path is outside the project root.", {"file": file_name}) from error
+    return path
+
+
 def find_translation_text_targets(root: Path, file_name: str, line: int | None = None, symbol: str = "", macro: str = "") -> list[dict[str, Any]]:
     path = resolve_project_file(root, file_name)
     source = read_utf8(path)
@@ -632,6 +644,71 @@ def command_scan_frontier(root: Path, _args: argparse.Namespace, _input: dict[st
             for key, path in paths.items()
         },
     }
+
+
+def command_png_to_jasc_pal(root: Path, args: argparse.Namespace, input_data: Any) -> dict[str, Any]:
+    require_project(root)
+    png_name = require_text_value(input_value(args, input_data, "png"), "png")
+    output_name = require_text_value(input_value(args, input_data, "output"), "output")
+    base_pal_name = input_value(args, input_data, "base_pal")
+    raw_colors = input_value(args, input_data, "colors", 16)
+    try:
+        palette_size = int(raw_colors)
+    except (TypeError, ValueError) as error:
+        raise CliError("invalid_palette_size", "colors must be 16, 224, or 256.", {"colors": raw_colors}) from error
+    png_path = resolve_project_file(root, png_name)
+    output_path = resolve_project_output(root, output_name)
+    base_pal_path = resolve_project_file(root, require_text_value(base_pal_name, "base_pal")) if base_pal_name else None
+    try:
+        result = write_jasc_pal_from_png(png_path, output_path, palette_size, base_pal_path=base_pal_path)
+    except (OSError, PaletteError, zlib.error) as error:
+        raise CliError("png_to_jasc_pal_failed", str(error), {"png": png_name, "output": output_name, "colors": palette_size}) from error
+    result["png"] = rel(root, png_path)
+    result["output"] = rel(root, output_path)
+    if base_pal_path:
+        result["base_palette"] = rel(root, base_pal_path)
+    if result.get("backup"):
+        result["backup"] = rel(root, Path(str(result["backup"])))
+    return result
+
+
+def command_analyze_png(root: Path, args: argparse.Namespace, input_data: Any) -> dict[str, Any]:
+    require_project(root)
+    png_name = require_text_value(input_value(args, input_data, "png"), "png")
+    png_path = resolve_project_file(root, png_name)
+    try:
+        result = analyze_png(png_path)
+    except (OSError, PaletteError, zlib.error) as error:
+        raise CliError("analyze_png_failed", str(error), {"png": png_name}) from error
+    result["png"] = rel(root, png_path)
+    return result
+
+
+def command_png_to_indexed(root: Path, args: argparse.Namespace, input_data: Any) -> dict[str, Any]:
+    require_project(root)
+    png_name = require_text_value(input_value(args, input_data, "png"), "png")
+    output_name = require_text_value(input_value(args, input_data, "output"), "output")
+    base_pal_name = input_value(args, input_data, "base_pal")
+    raw_colors = input_value(args, input_data, "colors", 16)
+    try:
+        palette_size = int(raw_colors)
+    except (TypeError, ValueError) as error:
+        raise CliError("invalid_palette_size", "colors must be 16, 224, or 256.", {"colors": raw_colors}) from error
+    no_quantize = bool(input_value(args, input_data, "no_quantize", False))
+    png_path = resolve_project_file(root, png_name)
+    output_path = resolve_project_output(root, output_name)
+    base_pal_path = resolve_project_file(root, require_text_value(base_pal_name, "base_pal")) if base_pal_name else None
+    try:
+        result = write_indexed_png_from_png(png_path, output_path, palette_size, base_pal_path=base_pal_path, quantize=not no_quantize)
+    except (OSError, PaletteError, zlib.error) as error:
+        raise CliError("png_to_indexed_failed", str(error), {"png": png_name, "output": output_name, "colors": palette_size}) from error
+    result["png"] = rel(root, png_path)
+    result["output"] = rel(root, output_path)
+    if base_pal_path:
+        result["base_palette"] = rel(root, base_pal_path)
+    if result.get("backup"):
+        result["backup"] = rel(root, Path(str(result["backup"])))
+    return result
 
 
 def command_scan_map_events(root: Path, args: argparse.Namespace, _input: Any) -> dict[str, Any]:
@@ -1132,6 +1209,19 @@ def build_parser() -> argparse.ArgumentParser:
     update_text.add_argument("--symbol", help="Optional symbol from scan-texts")
     update_text.add_argument("--macro", choices=["COMPOUND_STRING", "_"], help="Optional macro filter")
     update_text.add_argument("--text", help="New text; use --input-json for multi-line text")
+    analyze_png_parser = subparsers.add_parser("analyze-png", parents=[common], help="Analyze PNG suitability for GBA assets")
+    analyze_png_parser.add_argument("--png", help="Project-relative input PNG")
+    png_to_indexed = subparsers.add_parser("png-to-indexed", parents=[common], help="Convert a PNG to indexed PNG")
+    png_to_indexed.add_argument("--png", help="Project-relative input PNG")
+    png_to_indexed.add_argument("--output", help="Project-relative output PNG")
+    png_to_indexed.add_argument("--colors", type=int, choices=[16, 224, 256], default=16, help="Palette size")
+    png_to_indexed.add_argument("--base-pal", dest="base_pal", help="Optional project-relative JASC-PAL file to use as palette order")
+    png_to_indexed.add_argument("--no-quantize", action="store_true", help="Fail instead of reducing colors when the image exceeds the selected palette size")
+    png_to_pal = subparsers.add_parser("png-to-jasc-pal", parents=[common], help="Generate a JASC-PAL .pal file from a PNG")
+    png_to_pal.add_argument("--png", help="Project-relative input PNG")
+    png_to_pal.add_argument("--output", help="Project-relative output .pal")
+    png_to_pal.add_argument("--colors", type=int, choices=[16, 224, 256], default=16, help="Palette size")
+    png_to_pal.add_argument("--base-pal", dest="base_pal", help="Optional project-relative JASC-PAL file whose color order should be preferred")
     subparsers.add_parser("scan-frontier", parents=[common], help="Detect Battle Frontier related data files")
     scan_map_events = subparsers.add_parser("scan-map-events", parents=[common], help="List maps or inspect one map's event links")
     scan_map_events.add_argument("--map", help="Map folder name under data/maps")
@@ -1190,6 +1280,9 @@ COMMANDS = {
     "validate-project": command_validate_project,
     "scan-texts": command_scan_texts,
     "update-text": command_update_text,
+    "analyze-png": command_analyze_png,
+    "png-to-indexed": command_png_to_indexed,
+    "png-to-jasc-pal": command_png_to_jasc_pal,
     "scan-frontier": command_scan_frontier,
     "scan-map-events": command_scan_map_events,
     "search-map-scripts": command_search_map_scripts,

@@ -34,6 +34,7 @@ from expansionstudio.event_maps import (
     list_event_maps, load_map_event_bundle, rename_map_script_label,
     save_script_label, save_text_label, search_map_scripts,
 )
+from expansionstudio.palette import PaletteError, analyze_png, write_indexed_png_from_png, write_jasc_pal_from_png
 
 try:
     from PySide6.QtCore import QProcess, QProcessEnvironment, QSettings, QTimer, Qt, Signal
@@ -3482,12 +3483,19 @@ class AssetPanel(QWidget):
         layout = QVBoxLayout(self); bar = QHBoxLayout(); self.filter = QLineEdit(); self.filter.textChanged.connect(self.refresh); self.filter.setPlaceholderText("Filter path"); self.include_non_png = QCheckBox("PNG以外のみのグループも表示"); self.include_non_png.stateChanged.connect(self.refresh); self.sort = QComboBox(); self.sort.addItem("パス順", "path"); self.sort.addItem("未使用候補を先頭", "unused"); self.sort.addItem("参照数順", "references"); self.sort.currentIndexChanged.connect(self.refresh)
         analyze = QPushButton("参照解析"); analyze.clicked.connect(self.load_references); self._analyze = analyze; add = QPushButton(); add.clicked.connect(self.add_asset); self._add = add; replace = QPushButton("選択ファイルを差し替え"); replace.clicked.connect(self.replace_asset); self._replace = replace; quarantine = QPushButton("quarantineへ移動"); quarantine.clicked.connect(self.quarantine_group); self._quarantine = quarantine
         bar.addWidget(self.filter); bar.addWidget(self.include_non_png); bar.addWidget(QLabel("並び順")); bar.addWidget(self.sort); bar.addWidget(analyze); bar.addWidget(add); bar.addWidget(replace); bar.addWidget(quarantine); layout.addLayout(bar)
+        self._png_analyze = QPushButton("PNG診断"); self._png_analyze.clicked.connect(self.analyze_selected_png); bar.addWidget(self._png_analyze)
+        self._png_indexed = QPushButton("Indexed PNGへ変換"); self._png_indexed.clicked.connect(self.generate_indexed_png); bar.addWidget(self._png_indexed)
+        self._png_pal = QPushButton("PNGからJASC-PAL生成"); self._png_pal.clicked.connect(self.generate_jasc_pal); bar.addWidget(self._png_pal)
         split = QSplitter(Qt.Orientation.Horizontal); self.list = QListWidget(); self.list.currentItemChanged.connect(self.select); split.addWidget(self.list)
         detail = QWidget(); box = QVBoxLayout(detail); self.preview = QLabel("No asset selected"); self.preview.setAlignment(Qt.AlignmentFlag.AlignCenter); self.preview.setMinimumSize(560, 380); box.addWidget(self.preview)
         self.asset_path = QLabel(); self.asset_path.setWordWrap(True); box.addWidget(self.asset_path); self.usage = QLabel(); self.usage.setWordWrap(True); box.addWidget(self.usage); self.mode_info = QLabel(); self.mode_info.setWordWrap(True); box.addWidget(self.mode_info); self.members = QListWidget(); self.members.currentItemChanged.connect(lambda _current, _previous: self.select_member()); box.addWidget(QLabel("画像グループ (.png / .gbapal / .pal / .bin / .4bpp)")); box.addWidget(self.members); self.refs = QListWidget(); box.addWidget(QLabel("静的参照箇所 / 変換指定")); box.addWidget(self.refs); split.addWidget(detail); split.setSizes([520, 760]); layout.addWidget(split); self.retranslate()
 
     def retranslate(self) -> None:
         self._analyze.setText("参照解析"); self._add.setText("追加"); self._replace.setText("選択ファイルを差し替え"); self._quarantine.setText("quarantineへ移動")
+
+        if hasattr(self, "_png_analyze"): self._png_analyze.setText("PNG診断")
+        if hasattr(self, "_png_indexed"): self._png_indexed.setText("Indexed PNGへ変換")
+        if hasattr(self, "_png_pal"): self._png_pal.setText("PNGからJASC-PAL生成")
 
     def group_key(self, asset: Path) -> str:
         return rel(self.window.root, asset.with_suffix(""))
@@ -3659,6 +3667,81 @@ class AssetPanel(QWidget):
                     return len(colors)
         return len(colors)
 
+    def selected_png_or_prompt(self, title: str) -> Path | None:
+        group = self.selected_group()
+        selected = self.selected_asset()
+        default_png = selected if selected and selected.suffix.lower() == ".png" else (group.primary_image if group else None)
+        if default_png and default_png.exists() and default_png.suffix.lower() == ".png":
+            return default_png
+        start_dir = default_png.parent if default_png else self.window.root / "graphics"
+        source, _ = QFileDialog.getOpenFileName(self, title, str(start_dir), "PNG (*.png);;All files (*)")
+        return Path(source) if source else None
+
+    def ask_palette_size(self, title: str, default_index: int = 0) -> int | None:
+        color_text, ok = QInputDialog.getItem(self, title, "色数プリセット", ["16", "224", "256"], default_index, False)
+        return int(color_text) if ok else None
+
+    def optional_base_palette(self) -> Path | None:
+        if QMessageBox.question(self, "既存JASC-PAL", "既存.palのパレット順を基準にしますか？") != QMessageBox.StandardButton.Yes:
+            return None
+        group = self.selected_group()
+        selected = self.selected_asset()
+        start_dir = selected.parent if selected else (group.members[0].parent if group and group.members else self.window.root / "graphics")
+        source, _ = QFileDialog.getOpenFileName(self, "基準にするJASC-PALを選択", str(start_dir), "JASC-PAL (*.pal);;All files (*)")
+        return Path(source) if source else None
+
+    def analyze_selected_png(self) -> None:
+        source_path = self.selected_png_or_prompt("診断するPNGを選択")
+        if not source_path:
+            return
+        try:
+            result = analyze_png(source_path)
+        except (OSError, PaletteError) as error:
+            QMessageBox.critical(self, "PNG診断失敗", str(error)); return
+        lines = [
+            f"file: {rel(self.window.root, source_path) if self.is_under_root(source_path) else source_path.name}",
+            f"size: {result['width']} x {result['height']}",
+            f"type: {result['color_type_name']} / bit depth {result['bit_depth']}",
+            f"indexed: {'yes' if result['indexed'] else 'no'}",
+            f"used colors: {result['used_colors']}",
+            f"transparent: {'yes' if result['transparent'] else 'no'}",
+            f"4bpp: {'OK' if result['gba_4bpp'] else 'NG'}",
+            f"8bpp: {'OK' if result['gba_8bpp'] else 'NG'}",
+            f"224 colors: {'OK' if result['gba_224_color'] else 'NG'}",
+        ]
+        self.mode_info.setText("\n".join(lines))
+        QMessageBox.information(self, "PNG診断", "\n".join(lines))
+
+    def generate_indexed_png(self) -> None:
+        source_path = self.selected_png_or_prompt("Indexed PNGへ変換するPNGを選択")
+        if not source_path:
+            return
+        palette_size = self.ask_palette_size("Indexed PNG色数", 0)
+        if palette_size is None:
+            return
+        base_pal_path = self.optional_base_palette()
+        quantize = QMessageBox.question(self, "減色", "指定色数を超える場合は減色しますか？\n「いいえ」の場合は色数超過でエラーにします。") == QMessageBox.StandardButton.Yes
+        default_output = source_path.with_name(source_path.stem + "_indexed.png") if self.is_under_root(source_path) else self.window.root / "graphics" / (source_path.stem + "_indexed.png")
+        output, _ = QFileDialog.getSaveFileName(self, "Indexed PNG保存先", str(default_output), "PNG (*.png);;All files (*)")
+        if not output:
+            return
+        output_path = Path(output)
+        if output_path.suffix.lower() != ".png":
+            output_path = output_path.with_suffix(".png")
+        if not self.is_under_root(output_path):
+            QMessageBox.warning(self, "Invalid target", "保存先はプロジェクトroot内にしてください。")
+            return
+        if output_path.exists() and QMessageBox.question(self, "PNG exists", "既存PNGを .bak に退避して上書きしますか？") != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            result = write_indexed_png_from_png(source_path, output_path, palette_size, base_pal_path=base_pal_path, quantize=quantize)
+        except (OSError, PaletteError) as error:
+            QMessageBox.critical(self, "Indexed PNG変換失敗", str(error)); return
+        self.load()
+        backup = result.get("backup")
+        backup_text = f"\nbackup: {rel(self.window.root, Path(str(backup)))}" if backup else ""
+        QMessageBox.information(self, "Indexed PNG変換完了", f"{rel(self.window.root, output_path)}\nsource colors: {result['source_colors']}\nquantized: {result['quantized']}\ntransparent: {result['transparent']}{backup_text}")
+
     def inspect_copy(self, source: Path, target: Path) -> tuple[list[str], list[str], list[str]]:
         errors: list[str] = []; warnings: list[str] = []; details: list[str] = []
         source_suffix = source.suffix.lower(); target_suffix = target.suffix.lower()
@@ -3722,6 +3805,39 @@ class AssetPanel(QWidget):
         if warnings:
             message.extend(["", "警告:"] + warnings)
         return QMessageBox.question(self, "Asset copy check", "\n".join(message)) == QMessageBox.StandardButton.Yes
+
+    def generate_jasc_pal(self) -> None:
+        source_path = self.selected_png_or_prompt("PNGを選択")
+        if not source_path:
+            return
+        palette_size = self.ask_palette_size("JASC-PAL色数", 0)
+        if palette_size is None:
+            return
+        base_pal_path = self.optional_base_palette()
+        if self.is_under_root(source_path):
+            default_output = source_path.with_suffix(".pal")
+        else:
+            default_output = (self.window.root / "graphics" / source_path.name).with_suffix(".pal")
+        output, _ = QFileDialog.getSaveFileName(self, "JASC-PAL保存先", str(default_output), "JASC-PAL (*.pal);;All files (*)")
+        if not output:
+            return
+        output_path = Path(output)
+        if output_path.suffix.lower() != ".pal":
+            output_path = output_path.with_suffix(".pal")
+        if not self.is_under_root(output_path):
+            QMessageBox.warning(self, "Invalid target", "保存先はプロジェクトroot内にしてください。")
+            return
+        if output_path.exists() and QMessageBox.question(self, "Palette exists", "既存の .pal を .bak に退避して上書きしますか？") != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            result = write_jasc_pal_from_png(source_path, output_path, palette_size, base_pal_path=base_pal_path)
+        except (OSError, PaletteError) as error:
+            QMessageBox.critical(self, "JASC-PAL生成失敗", str(error)); return
+        self.load()
+        self.window.status(f"Generated JASC-PAL: {rel(self.window.root, output_path)}")
+        backup = result.get("backup")
+        backup_text = f"\nbackup: {rel(self.window.root, Path(str(backup)))}" if backup else ""
+        QMessageBox.information(self, "JASC-PAL生成完了", f"{rel(self.window.root, output_path)}\nused colors: {result['used_colors']} / {palette_size}\npadded: {result['padded_colors']}{backup_text}")
 
     def add_asset(self) -> None:
         source, _ = QFileDialog.getOpenFileName(self, "追加するアセットを選択", str(self.window.root), self.COPY_FILTER)
@@ -6055,6 +6171,7 @@ class GeneralTrainerBlock:
     name: str
     trainer_class: str
     party_count: int
+    line: int
 
 
 @dataclass
@@ -6066,6 +6183,18 @@ class TrainerPartyMonBlock:
     species: str
     level: str
     item: str
+
+
+MUGSHOT_COLOR_CHOICES = ["Purple", "Green", "Pink", "Blue", "Yellow", "None"]
+TEAM_MARK_CLASS_CHOICES = [
+    ("変更しない", ""),
+    ("マグマ団: Team Magma", "Team Magma"),
+    ("マグマ団リーダー: Magma Leader", "Magma Leader"),
+    ("マグマ団幹部: Magma Admin", "Magma Admin"),
+    ("アクア団: Team Aqua", "Team Aqua"),
+    ("アクア団リーダー: Aqua Leader", "Aqua Leader"),
+    ("アクア団幹部: Aqua Admin", "Aqua Admin"),
+]
 
 
 def event_label_prefix(map_name: str) -> str:
@@ -7100,14 +7229,18 @@ class BattleFrontierPanel(QWidget):
     def build_general_trainers_tab(self) -> None:
         page = QWidget(); layout = QVBoxLayout(page); split = QSplitter(Qt.Orientation.Horizontal)
         left = QWidget(); left.setMinimumWidth(LIST_PANEL_MIN_WIDTH); left_layout = QVBoxLayout(left)
-        self.general_trainer_search = QLineEdit(); self.general_trainer_search.setPlaceholderText("TRAINER_ / name / class / Pokemon"); self.general_trainer_search.textChanged.connect(self.refresh_general_trainers); left_layout.addWidget(self.general_trainer_search)
-        self.general_trainer_table = QTableWidget(0, 5); self.general_trainer_table.setHorizontalHeaderLabels(["Trainer", "Name", "Class", "Pokemon", "Flags"]); self.general_trainer_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows); self.general_trainer_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers); self.general_trainer_table.itemSelectionChanged.connect(self.select_general_trainer); left_layout.addWidget(self.general_trainer_table); split.addWidget(left)
-        self.set_columns(self.general_trainer_table, [240, 150, 170, 80, 170])
+        self.general_trainer_search = QLineEdit(); self.general_trainer_search.setPlaceholderText("TRAINER_ / name / class / message / Pokemon"); self.general_trainer_search.textChanged.connect(self.refresh_general_trainers); left_layout.addWidget(self.general_trainer_search)
+        self.general_trainer_table = QTableWidget(0, 6); self.general_trainer_table.setHorizontalHeaderLabels(["Line", "Trainer", "Name", "Class", "Pokemon", "Flags"]); self.general_trainer_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows); self.general_trainer_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers); self.general_trainer_table.itemSelectionChanged.connect(self.select_general_trainer); left_layout.addWidget(self.general_trainer_table); split.addWidget(left)
+        self.set_columns(self.general_trainer_table, [70, 240, 150, 170, 80, 170])
         right = QWidget(); right.setMinimumWidth(DETAIL_PANEL_MIN_WIDTH); right_layout = QVBoxLayout(right)
         self.general_trainer_label = QLabel("Select a trainer.party block."); self.general_trainer_label.setWordWrap(True); right_layout.addWidget(self.general_trainer_label)
-        form_box = QGroupBox("Trainer"); form = QFormLayout(form_box); self.general_name_edit = QLineEdit(); self.general_class_edit = QLineEdit(); self.general_name_edit.textChanged.connect(self.general_fields_changed); self.general_class_edit.textChanged.connect(self.general_fields_changed); form.addRow("Name", self.general_name_edit); form.addRow("Class", self.general_class_edit); right_layout.addWidget(form_box)
+        form_box = QGroupBox("Trainer"); form = QFormLayout(form_box); self.general_id_label = QLabel(); self.general_id_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse); self.general_file_label = QLabel(); self.general_file_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse); self.general_name_edit = QLineEdit(); self.general_class_edit = QLineEdit(); self.general_name_edit.textChanged.connect(self.general_fields_changed); self.general_class_edit.textChanged.connect(self.general_fields_changed); form.addRow("Trainer ID", self.general_id_label); form.addRow("File", self.general_file_label); form.addRow("Name", self.general_name_edit); form.addRow("Class", self.general_class_edit); right_layout.addWidget(form_box)
         edit_tabs = QTabWidget(); party_page = QWidget(); party_layout = QVBoxLayout(party_page); self.general_party_table = QTableWidget(0, 4); self.general_party_table.setHorizontalHeaderLabels(["No.", "Pokemon", "Level", "Item"]); self.general_party_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows); self.general_party_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers); self.general_party_table.itemSelectionChanged.connect(self.select_general_party_mon); self.set_columns(self.general_party_table, [48, 220, 90, 180]); party_layout.addWidget(self.general_party_table)
         self.general_party_editor = QPlainTextEdit(); party_layout.addWidget(self.general_party_editor); party_buttons = QHBoxLayout(); add_mon = QPushButton("Add Pokemon"); add_mon.clicked.connect(self.add_general_party_mon); delete_mon = QPushButton("Delete Pokemon"); delete_mon.clicked.connect(self.delete_general_party_mon); apply_mon = QPushButton("Apply Pokemon edit"); apply_mon.clicked.connect(self.apply_general_party_mon); party_buttons.addWidget(add_mon); party_buttons.addWidget(delete_mon); party_buttons.addStretch(); party_buttons.addWidget(apply_mon); party_layout.addLayout(party_buttons); edit_tabs.addTab(party_page, "Pokemon")
+        fields_page = QWidget(); fields_layout = QVBoxLayout(fields_page); self.general_fields_table = QTableWidget(0, 2); self.general_fields_table.setHorizontalHeaderLabels(["Field", "Value"]); self.general_fields_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows); self.set_columns(self.general_fields_table, [220, 520]); fields_layout.addWidget(QLabel("Existing TRAINER header fields. Name/Class are edited above; unknown fields are preserved.")); fields_layout.addWidget(self.general_fields_table); apply_fields = QPushButton("Apply field edits"); apply_fields.clicked.connect(self.apply_general_metadata_tables); fields_layout.addWidget(apply_fields); edit_tabs.addTab(fields_page, "Fields")
+        cutin_page = QWidget(); cutin_layout = QVBoxLayout(cutin_page); cutin_form = QFormLayout(); self.general_pic_edit = QLineEdit(); self.general_pic_edit.textChanged.connect(self.general_cutin_changed); self.general_mugshot_combo = QComboBox(); self.general_mugshot_combo.addItem("(not set)", ""); [self.general_mugshot_combo.addItem(label, label) for label in MUGSHOT_COLOR_CHOICES]; self.general_mugshot_combo.currentIndexChanged.connect(self.general_cutin_changed); self.general_starting_status_edit = QLineEdit(); self.general_starting_status_edit.textChanged.connect(self.general_cutin_changed); self.general_team_mark_combo = QComboBox(); [self.general_team_mark_combo.addItem(label, value) for label, value in TEAM_MARK_CLASS_CHOICES]; self.general_team_mark_combo.currentIndexChanged.connect(self.general_team_mark_changed); cutin_form.addRow("Trainer pic / icon source", self.general_pic_edit); cutin_form.addRow("Mugshot cut-in color", self.general_mugshot_combo); cutin_form.addRow("Starting Status", self.general_starting_status_edit); cutin_form.addRow("Team mark transition helper", self.general_team_mark_combo); cutin_layout.addLayout(cutin_form); self.general_cutin_note = QLabel("Mugshot creates B_TRANSITION_MUGSHOT. Magma/Aqua mark transitions are class-driven in src/battle_setup.c: Team Magma/Magma Leader/Magma Admin -> B_TRANSITION_MAGMA, Team Aqua/Aqua Leader/Aqua Admin -> B_TRANSITION_AQUA."); self.general_cutin_note.setWordWrap(True); self.general_cutin_note.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse); cutin_layout.addWidget(self.general_cutin_note); cutin_layout.addStretch(); edit_tabs.addTab(cutin_page, "Cut-in / Icons")
+        messages_page = QWidget(); messages_layout = QVBoxLayout(messages_page); self.general_messages_table = QTableWidget(0, 2); self.general_messages_table.setHorizontalHeaderLabels(["Message Field", "Text"]); self.general_messages_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows); self.set_columns(self.general_messages_table, [220, 620]); messages_layout.addWidget(QLabel("Only message/dialogue fields that already exist in this TRAINER block are shown.")); messages_layout.addWidget(self.general_messages_table); apply_messages = QPushButton("Apply message edits"); apply_messages.clicked.connect(self.apply_general_metadata_tables); messages_layout.addWidget(apply_messages); edit_tabs.addTab(messages_page, "Messages")
+        ace_page = QWidget(); ace_layout = QVBoxLayout(ace_page); self.general_ace_table = QTableWidget(0, 2); self.general_ace_table.setHorizontalHeaderLabels(["Ace Field", "Value"]); self.general_ace_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows); self.set_columns(self.general_ace_table, [220, 420]); ace_layout.addWidget(QLabel("Only ace/last-mon fields that already exist in this TRAINER block are shown.")); ace_layout.addWidget(self.general_ace_table); apply_ace = QPushButton("Apply ace edits"); apply_ace.clicked.connect(self.apply_general_metadata_tables); ace_layout.addWidget(apply_ace); edit_tabs.addTab(ace_page, "Ace Settings")
         raw_page = QWidget(); raw_layout = QVBoxLayout(raw_page); self.general_trainer_editor = QPlainTextEdit(); self.general_trainer_editor.textChanged.connect(self.general_trainer_changed); raw_layout.addWidget(self.general_trainer_editor); edit_tabs.addTab(raw_page, "Raw")
         right_layout.addWidget(edit_tabs)
         buttons = QHBoxLayout(); diff = QPushButton("Trainer.party diff"); diff.clicked.connect(self.show_general_trainer_diff); save = QPushButton("Save trainer.party block"); save.clicked.connect(self.save_general_trainer); buttons.addStretch(); buttons.addWidget(diff); buttons.addWidget(save); right_layout.addLayout(buttons)
@@ -7470,12 +7603,43 @@ class BattleFrontierPanel(QWidget):
         for index, match in enumerate(headers):
             start = match.start(); end = headers[index + 1].start() if index + 1 < len(headers) else len(self.general_trainer_source)
             raw = self.general_trainer_source[start:end]
-            self.general_trainers.append(GeneralTrainerBlock(self.general_trainer_path, match.group(1), start, end, raw, self.trainer_party_field(raw, "Name"), self.trainer_party_field(raw, "Class"), self.trainer_party_count(raw)))
+            line = self.general_trainer_source.count("\n", 0, start) + 1
+            self.general_trainers.append(GeneralTrainerBlock(self.general_trainer_path, match.group(1), start, end, raw, self.trainer_party_field(raw, "Name"), self.trainer_party_field(raw, "Class"), self.trainer_party_count(raw), line))
 
     @staticmethod
     def trainer_party_field(block: str, name: str) -> str:
         match = re.search(rf"(?m)^{re.escape(name)}:\s*(.*)$", block)
         return match.group(1).strip() if match else ""
+
+    @staticmethod
+    def trainer_party_header(block: str) -> str:
+        first_line_end = block.find("\n")
+        if first_line_end < 0:
+            return ""
+        body_start = BattleFrontierPanel.trainer_party_body_start(block)
+        return block[first_line_end + 1:body_start]
+
+    @staticmethod
+    def trainer_party_header_fields(block: str) -> list[tuple[str, str]]:
+        header = BattleFrontierPanel.trainer_party_header(block)
+        fields: list[tuple[str, str]] = []
+        for match in re.finditer(r"(?m)^([^:\r\n]{1,80}):[ \t]*(.*)$", header):
+            name = match.group(1).strip()
+            if name:
+                fields.append((name, match.group(2).strip()))
+        return fields
+
+    @staticmethod
+    def is_trainer_dialogue_field(name: str) -> bool:
+        lowered = name.casefold()
+        keywords = ("message", "text", "speech", "quote", "dialogue", "intro", "before", "after", "victory", "defeat", "win", "lose", "critical", "weak", "ace")
+        return any(keyword in lowered for keyword in keywords)
+
+    @staticmethod
+    def is_trainer_ace_field(name: str) -> bool:
+        lowered = name.casefold().replace("_", " ")
+        keywords = ("ace", "last mon", "last pokemon", "force last", "should use ace", "shoulduseace")
+        return any(keyword in lowered for keyword in keywords)
 
     @staticmethod
     def trainer_party_count(block: str) -> int:
@@ -7489,6 +7653,11 @@ class BattleFrontierPanel(QWidget):
         header_end = block.find("\n")
         insert_at = len(block) if header_end < 0 else header_end + 1
         return block[:insert_at] + f"{name}: {value}\n" + block[insert_at:]
+
+    @staticmethod
+    def remove_trainer_party_field(block: str, name: str) -> str:
+        pattern = re.compile(rf"(?m)^{re.escape(name)}:[^\r\n]*(?:\r?\n)?")
+        return pattern.sub("", block, count=1)
 
     @staticmethod
     def trainer_party_body_start(block: str) -> int:
@@ -8138,6 +8307,7 @@ class BattleFrontierPanel(QWidget):
     def capture_general_trainer(self) -> None:
         if self.current_general_trainer and not self.loading:
             self.apply_general_party_mon(silent=True)
+            self.apply_general_metadata_tables(silent=True)
             self.general_trainer_states[self.current_general_trainer.key] = self.general_trainer_editor.toPlainText()
 
     def general_trainer_text(self, block: GeneralTrainerBlock) -> str:
@@ -8146,27 +8316,35 @@ class BattleFrontierPanel(QWidget):
     def visible_general_trainers(self) -> list[GeneralTrainerBlock]:
         query = self.general_trainer_search.text().casefold(); rows: list[GeneralTrainerBlock] = []
         for block in self.general_trainers:
-            text = " ".join([block.key, block.name, block.trainer_class, block.raw]).casefold()
+            current = self.general_trainer_text(block)
+            text = " ".join([block.key, self.trainer_party_field(current, "Name"), self.trainer_party_field(current, "Class"), current]).casefold()
             if not query or query in text:
                 rows.append(block)
         return rows
 
     @staticmethod
-    def general_trainer_flags(block: GeneralTrainerBlock) -> str:
+    def general_trainer_flags_from_text(text: str) -> str:
         flags = []
-        raw = block.raw.casefold()
-        if re.search(r"(?mi)^double battle:\s*yes", block.raw): flags.append("Double")
-        if re.search(r"(?mi)^items:\s*\S", block.raw): flags.append("Items")
+        raw = text.casefold()
+        if re.search(r"(?mi)^double battle:\s*yes", text): flags.append("Double")
+        if re.search(r"(?mi)^items:\s*\S", text): flags.append("Items")
+        if re.search(r"(?mi)^mugshot:\s*\S", text): flags.append("Mugshot")
+        trainer_class = BattleFrontierPanel.trainer_party_field(text, "Class")
+        if trainer_class in {"Team Magma", "Magma Leader", "Magma Admin"}: flags.append("Magma")
+        if trainer_class in {"Team Aqua", "Aqua Leader", "Aqua Admin"}: flags.append("Aqua")
         if "shiny: yes" in raw: flags.append("Shiny")
         if "dynamax level:" in raw or "gigantamax: yes" in raw: flags.append("DMax")
         if "tera type:" in raw: flags.append("Tera")
+        if any(BattleFrontierPanel.is_trainer_dialogue_field(name) for name, _value in BattleFrontierPanel.trainer_party_header_fields(text)): flags.append("Msg")
+        if any(BattleFrontierPanel.is_trainer_ace_field(name) for name, _value in BattleFrontierPanel.trainer_party_header_fields(text)): flags.append("Ace")
         return ", ".join(flags)
 
     def refresh_general_trainers(self) -> None:
         rows = self.visible_general_trainers(); self.general_trainer_table.setRowCount(len(rows))
         for row, block in enumerate(rows):
-            dirty = self.general_trainer_text(block) != block.raw
-            values = [("*" if dirty else "") + block.key, block.name, block.trainer_class, str(block.party_count), self.general_trainer_flags(block)]
+            current = self.general_trainer_text(block)
+            dirty = current != block.raw
+            values = [str(block.line), ("*" if dirty else "") + block.key, self.trainer_party_field(current, "Name"), self.trainer_party_field(current, "Class"), str(self.trainer_party_count(current)), self.general_trainer_flags_from_text(current)]
             for column, value in enumerate(values):
                 item = QTableWidgetItem(value); item.setData(Qt.ItemDataRole.UserRole, block); self.general_trainer_table.setItem(row, column, item)
 
@@ -8180,10 +8358,14 @@ class BattleFrontierPanel(QWidget):
         self.loading = True
         self.general_name_edit.setText(self.current_general_trainer.name); self.general_class_edit.setText(self.current_general_trainer.trainer_class)
         self.general_trainer_editor.setPlainText(self.general_trainer_text(self.current_general_trainer))
+        self.general_id_label.setText(self.current_general_trainer.key)
+        self.general_file_label.setText(f"{rel(self.window.root, self.current_general_trainer.path)}:{self.current_general_trainer.line}")
         self.general_party_editor.clear()
         self.loading = False
         self.refresh_general_party_table()
-        self.general_trainer_label.setText(f"{self.current_general_trainer.key} / {self.current_general_trainer.name} / {self.current_general_trainer.trainer_class} / Pokemon {self.current_general_trainer.party_count}")
+        self.refresh_general_metadata_tables()
+        current_text = self.general_trainer_editor.toPlainText()
+        self.general_trainer_label.setText(f"{self.current_general_trainer.key} / {self.trainer_party_field(current_text, 'Name')} / {self.trainer_party_field(current_text, 'Class')} / Pokemon {self.trainer_party_count(current_text)}")
 
     def general_trainer_changed(self) -> None:
         if self.loading or not self.current_general_trainer: return
@@ -8193,6 +8375,7 @@ class BattleFrontierPanel(QWidget):
         self.general_name_edit.setText(self.trainer_party_field(text, "Name")); self.general_class_edit.setText(self.trainer_party_field(text, "Class"))
         self.general_name_edit.blockSignals(False); self.general_class_edit.blockSignals(False)
         self.refresh_general_party_table()
+        self.refresh_general_metadata_tables()
         self.refresh_general_trainers(); self.window.status(f"Pending trainer.party block: {self.current_general_trainer.key}")
 
     def general_fields_changed(self) -> None:
@@ -8203,6 +8386,122 @@ class BattleFrontierPanel(QWidget):
         text = self.set_trainer_party_field(text, "Class", self.general_class_edit.text().strip())
         self.set_general_trainer_text(text)
         self.window.status(f"Pending trainer fields: {self.current_general_trainer.key}")
+
+    def set_general_mugshot_combo(self, value: str) -> None:
+        if not hasattr(self, "general_mugshot_combo"):
+            return
+        index = self.general_mugshot_combo.findData(value)
+        self.general_mugshot_combo.setCurrentIndex(index if index >= 0 else 0)
+
+    def set_general_team_mark_combo(self, trainer_class: str) -> None:
+        if not hasattr(self, "general_team_mark_combo"):
+            return
+        index = self.general_team_mark_combo.findData(trainer_class)
+        self.general_team_mark_combo.setCurrentIndex(index if index >= 0 else 0)
+
+    def refresh_general_cutin_controls(self) -> None:
+        if not self.current_general_trainer or not hasattr(self, "general_pic_edit"):
+            return
+        text = self.general_trainer_editor.toPlainText()
+        self.general_pic_edit.blockSignals(True)
+        self.general_mugshot_combo.blockSignals(True)
+        self.general_starting_status_edit.blockSignals(True)
+        self.general_team_mark_combo.blockSignals(True)
+        self.general_pic_edit.setText(self.trainer_party_field(text, "Pic"))
+        self.set_general_mugshot_combo(self.trainer_party_field(text, "Mugshot"))
+        self.general_starting_status_edit.setText(self.trainer_party_field(text, "Starting Status"))
+        self.set_general_team_mark_combo(self.trainer_party_field(text, "Class"))
+        self.general_pic_edit.blockSignals(False)
+        self.general_mugshot_combo.blockSignals(False)
+        self.general_starting_status_edit.blockSignals(False)
+        self.general_team_mark_combo.blockSignals(False)
+
+    def apply_general_cutin_controls(self, text: str) -> str:
+        if not hasattr(self, "general_pic_edit"):
+            return text
+        pic = self.general_pic_edit.text().strip()
+        if pic:
+            text = self.set_trainer_party_field(text, "Pic", pic)
+        mugshot = str(self.general_mugshot_combo.currentData() or "")
+        if mugshot:
+            text = self.set_trainer_party_field(text, "Mugshot", mugshot)
+        else:
+            text = self.remove_trainer_party_field(text, "Mugshot")
+        starting_status = self.general_starting_status_edit.text().strip()
+        if starting_status:
+            text = self.set_trainer_party_field(text, "Starting Status", starting_status)
+        else:
+            text = self.remove_trainer_party_field(text, "Starting Status")
+        return text
+
+    def general_cutin_changed(self) -> None:
+        if self.loading or not self.current_general_trainer:
+            return
+        text = self.apply_general_cutin_controls(self.general_trainer_editor.toPlainText())
+        self.set_general_trainer_text(text, refresh_party=False)
+        self.refresh_general_metadata_tables()
+        self.window.status(f"Pending trainer cut-in settings: {self.current_general_trainer.key}")
+
+    def general_team_mark_changed(self) -> None:
+        if self.loading or not self.current_general_trainer:
+            return
+        trainer_class = str(self.general_team_mark_combo.currentData() or "")
+        if not trainer_class:
+            return
+        self.general_class_edit.setText(trainer_class)
+
+    def populate_general_field_table(self, table: QTableWidget, rows: list[tuple[str, str]]) -> None:
+        table.blockSignals(True); table.setRowCount(len(rows))
+        for row, (field_name, value) in enumerate(rows):
+            field_item = QTableWidgetItem(field_name)
+            field_item.setFlags(field_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            value_item = QTableWidgetItem(value)
+            table.setItem(row, 0, field_item)
+            table.setItem(row, 1, value_item)
+        table.blockSignals(False)
+
+    def refresh_general_metadata_tables(self) -> None:
+        if not self.current_general_trainer or not hasattr(self, "general_fields_table"):
+            return
+        fields = self.trainer_party_header_fields(self.general_trainer_editor.toPlainText())
+        cutin_fields = {"Pic", "Mugshot", "Starting Status"}
+        extra_fields = [(name, value) for name, value in fields if name not in {"Name", "Class", *cutin_fields} and not self.is_trainer_dialogue_field(name) and not self.is_trainer_ace_field(name)]
+        message_fields = [(name, value) for name, value in fields if self.is_trainer_dialogue_field(name)]
+        ace_fields = [(name, value) for name, value in fields if self.is_trainer_ace_field(name)]
+        self.refresh_general_cutin_controls()
+        self.populate_general_field_table(self.general_fields_table, extra_fields)
+        self.populate_general_field_table(self.general_messages_table, message_fields)
+        self.populate_general_field_table(self.general_ace_table, ace_fields)
+
+    def apply_general_table_fields(self, text: str, table: QTableWidget) -> str:
+        for row in range(table.rowCount()):
+            field_item = table.item(row, 0)
+            value_item = table.item(row, 1)
+            if not field_item or not value_item:
+                continue
+            field_name = field_item.text().strip()
+            if not field_name:
+                continue
+            text = self.set_trainer_party_field(text, field_name, value_item.text())
+        return text
+
+    def apply_general_metadata_tables(self, silent: bool = False) -> None:
+        if self.loading or not self.current_general_trainer or not hasattr(self, "general_fields_table"):
+            return
+        text = self.general_trainer_editor.toPlainText()
+        text = self.set_trainer_party_field(text, "Name", self.general_name_edit.text().strip())
+        text = self.set_trainer_party_field(text, "Class", self.general_class_edit.text().strip())
+        text = self.apply_general_cutin_controls(text)
+        text = self.apply_general_table_fields(text, self.general_fields_table)
+        text = self.apply_general_table_fields(text, self.general_messages_table)
+        text = self.apply_general_table_fields(text, self.general_ace_table)
+        if silent:
+            self.general_trainer_states[self.current_general_trainer.key] = text
+            self.general_trainer_editor.blockSignals(True); self.general_trainer_editor.setPlainText(text); self.general_trainer_editor.blockSignals(False)
+            return
+        self.set_general_trainer_text(text, refresh_party=False)
+        self.refresh_general_metadata_tables()
+        self.window.status(f"Pending trainer metadata: {self.current_general_trainer.key}")
 
     def refresh_general_party_table(self) -> None:
         if not hasattr(self, "general_party_table"):
@@ -8288,6 +8587,9 @@ class BattleFrontierPanel(QWidget):
         new_block = self.general_trainer_text(self.current_general_trainer)
         if new_block == self.current_general_trainer.raw:
             self.window.status("No trainer.party changes"); return
+        target_file = rel(self.window.root, self.general_trainer_path)
+        if QMessageBox.question(self, "Save trainer.party", f"Write changes to:\n{target_file}\n\nA .bak backup will be created before saving.") != QMessageBox.StandardButton.Yes:
+            return
         try:
             disk = read_utf8(self.general_trainer_path)
             if disk[self.current_general_trainer.start:self.current_general_trainer.end] != self.current_general_trainer.raw:
@@ -8304,7 +8606,7 @@ class BattleFrontierPanel(QWidget):
 
     def select_general_trainer_key(self, key: str) -> None:
         for row in range(self.general_trainer_table.rowCount()):
-            item = self.general_trainer_table.item(row, 0)
+            item = self.general_trainer_table.item(row, 1)
             if item and item.text().lstrip("*") == key:
                 self.general_trainer_table.selectRow(row); return
 

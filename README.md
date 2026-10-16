@@ -30,6 +30,13 @@ It is an experimental alpha tool. It edits source files directly, so keep your p
 - CLI tools for external automation
 - Local stdio MCP server for ChatGPT Desktop / Codex integration
 
+- <img width="981" height="364" alt="{D04066D6-BA70-45E4-B208-DC1AAB794D2B}" src="https://github.com/user-attachments/assets/a14d9faf-5963-4189-8d9e-295f3d0a87e8" />
+
+<img width="983" height="565" alt="{6533CA58-BC2F-4699-BFDF-C1476F23DC89}" src="https://github.com/user-attachments/assets/02e4b8d3-c584-41b1-963a-23df4ffaa186" />
+
+<img width="986" height="591" alt="{EA65C494-2621-4D05-B96D-361BF01734EB}" src="https://github.com/user-attachments/assets/dff95886-f906-4005-92db-b1e7458914b0" />
+
+
 ## Supported Projects
 
 Best supported:
